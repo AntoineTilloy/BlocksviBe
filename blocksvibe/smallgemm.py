@@ -30,18 +30,27 @@ extern "C" __global__ void smallgemm(const int* A, const int* B, int* O, i64 T, 
         bool na = a[L - 1] >> 31, nb = b[L - 1] >> 31;
         if (na) { u64 c = 1; for (int l = 0; l < L; l++) { u64 v = (u64)(~a[l]) + c; a[l] = (u32)v; c = v >> 32; } }
         if (nb) { u64 c = 1; for (int l = 0; l < L; l++) { u64 v = (u64)(~b[l]) + c; b[l] = (u32)v; c = v >> 32; } }
-        u32 p[2 * L];
-        for (int l = 0; l < 2 * L; l++) p[l] = 0;
+        // acc +-= a b row by row (mpn_addmul_1 / mpn_submul_1), no separate product buffer
+        #pragma unroll
         for (int x = 0; x < L; x++) {
-            u32 ax = a[x]; if (!ax) continue;
+            u32 ax = a[x];
             u64 c = 0;
-            for (int y = 0; y < L; y++) { u64 v = (u64)ax * b[y] + p[x + y] + c; p[x + y] = (u32)v; c = v >> 32; }
-            p[x + L] = (u32)c;
+            if (na == nb) {
+                #pragma unroll
+                for (int y = 0; y < L; y++) { u64 v = (u64)ax * b[y] + acc[x + y] + c; acc[x + y] = (u32)v; c = v >> 32; }
+                #pragma unroll
+                for (int l = x + L; l < LW; l++) { u64 v = (u64)acc[l] + c; acc[l] = (u32)v; c = v >> 32; }
+            } else {
+                #pragma unroll
+                for (int y = 0; y < L; y++) {
+                    u64 pr = (u64)ax * b[y] + c;          // subtract lo(pr), carry hi(pr) + borrow
+                    u32 lo = (u32)pr; u32 cur = acc[x + y];
+                    acc[x + y] = cur - lo; c = (pr >> 32) + (cur < lo);
+                }
+                #pragma unroll
+                for (int l = x + L; l < LW; l++) { u32 cur = acc[l]; acc[l] = cur - (u32)c; c = (cur < (u32)c); }
+            }
         }
-        if (na == nb) { u64 c = 0; for (int l = 0; l < 2 * L; l++) { u64 v = (u64)acc[l] + p[l] + c; acc[l] = (u32)v; c = v >> 32; }
-                        for (int l = 2 * L; l < LW; l++) { u64 v = (u64)acc[l] + c; acc[l] = (u32)v; c = v >> 32; } }
-        else { u64 bw = 0; for (int l = 0; l < 2 * L; l++) { u64 v = (u64)acc[l] - p[l] - bw; acc[l] = (u32)v; bw = (v >> 32) & 1; }
-               for (int l = 2 * L; l < LW; l++) { u64 v = (u64)acc[l] - bw; acc[l] = (u32)v; bw = (v >> 32) & 1; } }
     }
     for (int l = 0; l < LW; l++) O[l * tot + idx] = (int)acc[l];
 }
