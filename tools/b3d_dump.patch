@@ -1,0 +1,97 @@
+diff --git a/src/dump.hxx b/src/dump.hxx
+new file mode 100644
+index 0000000..9dc46f0
+--- /dev/null
++++ b/src/dump.hxx
+@@ -0,0 +1,16 @@
++#pragma once
++// Debug dump of recursion inputs/outputs for external (GPU) re-implementation checks.
++// Enabled by setting B3D_DUMP=<path prefix>.
++#include "Bigfloat.hxx"
++#include <cstdlib>
++#include <fstream>
++#include <iomanip>
++#include <string>
++
++inline const char *b3d_dump_prefix() { return std::getenv("B3D_DUMP"); }
++
++inline void b3d_set_precision(std::ostream &os)
++{
++  os << std::setprecision(
++    int(boost::multiprecision::mpf_float::default_precision()) + 5);
++}
+diff --git a/src/lambda_log_r_tables/lambda_log_r_deriv/conformal_block_derivatives/conformal_block_derivatives.cxx b/src/lambda_log_r_tables/lambda_log_r_deriv/conformal_block_derivatives/conformal_block_derivatives.cxx
+index fa9e6da..3c6bc4d 100644
+--- a/src/lambda_log_r_tables/lambda_log_r_deriv/conformal_block_derivatives/conformal_block_derivatives.cxx
++++ b/src/lambda_log_r_tables/lambda_log_r_deriv/conformal_block_derivatives/conformal_block_derivatives.cxx
+@@ -1,4 +1,5 @@
+ #include "../Delta_Fraction.hxx"
++#include "../../../dump.hxx"
+ #include "../../Cache.hxx"
+ #include "../../../Q4pm.hxx"
+ #include "../../../so3_tensor_parity.hxx"
+@@ -151,6 +152,30 @@ conformal_block_derivatives(
+                               pseudo_parity_types, order, m_matrix, pole_types,
+                               num_threads));
+   recursion_timer.stop();
++  if(b3d_dump_prefix())
++    {
++      std::ofstream os(std::string(b3d_dump_prefix()) + "_n" + std::to_string(n)
++                       + ".txt");
++      b3d_set_precision(os);
++      os << "P " << pseudo_parity_types[0][0] << " " << pseudo_parity_types[0][1]
++         << " " << pseudo_parity_types[1][0] << " " << pseudo_parity_types[1][1]
++         << "\n";
++      for(size_t pp(0); pp != h_inf.size(); ++pp)
++        for(size_t m(0); m != h_inf[pp].size(); ++m)
++          for(size_t j(0); j != h_inf[pp][m].size(); ++j)
++            for(size_t a(0); a != h_inf[pp][m][j].size(); ++a)
++              for(size_t b(0); b != h_inf[pp][m][j][a].size(); ++b)
++                os << "H " << pp << " " << m << " " << j << " " << a << " " << b
++                   << " " << h_inf[pp][m][j][a][b] << "\n";
++      for(size_t pp(0); pp != residues.size(); ++pp)
++        for(size_t m(0); m != residues[pp].size(); ++m)
++          for(size_t j(0); j != residues[pp][m].size(); ++j)
++            for(size_t q(0); q != residues[pp][m][j].size(); ++q)
++              for(size_t a(0); a != residues[pp][m][j][q].size(); ++a)
++                for(size_t b(0); b != residues[pp][m][j][q][a].size(); ++b)
++                  os << "R " << pp << " " << m << " " << j << " " << q << " " << a
++                     << " " << b << " " << residues[pp][m][j][q][a][b] << "\n";
++    }
+ 
+   // TODO: This does nontrivial computation. Only do at high
+   // verbosity.
+diff --git a/src/lambda_log_r_tables/lambda_log_r_tables.cxx b/src/lambda_log_r_tables/lambda_log_r_tables.cxx
+index 8bd218e..c895d3a 100644
+--- a/src/lambda_log_r_tables/lambda_log_r_tables.cxx
++++ b/src/lambda_log_r_tables/lambda_log_r_tables.cxx
+@@ -1,4 +1,5 @@
+ #include "Cache.hxx"
++#include "../dump.hxx"
+ #include "../Log_r_Derivatives.hxx"
+ #include "../Q4pm.hxx"
+ #include "../compute_pseudo_parity_types.hxx"
+@@ -130,6 +131,23 @@ lambda_log_r_tables(const std::array<int64_t, 4> &two_js,
+                       four_point_parity(two_js, q4pm.vec), order, pole_types,
+                       clebsch_gordan_cache, factorial);
+   m_matrix_timer.stop();
++  if(b3d_dump_prefix())
++    {
++      std::ofstream os(std::string(b3d_dump_prefix()) + "_M.txt");
++      b3d_set_precision(os);
++      // M type value delta(0=12,1=43) two_jNN prime_pseudo_parity two_j rows cols entries...
++      for(auto &[key, mat] : m_matrix.cache)
++        {
++          auto &[pole, d, two_jNN, ppp, two_j] = key;
++          os << "M " << int(pole.type) << " " << pole.value << " " << int(d)
++             << " " << two_jNN << " " << ppp << " " << two_j << " "
++             << mat.size() << " " << (mat.empty() ? 0 : mat[0].size());
++          for(auto &row : mat)
++            for(auto &x : row)
++              os << " " << x;
++          os << "\n";
++        }
++    }
+   std::cout << "Done with m_matrix" << std::endl;
+   // TODO: This does nontrivial computation -- only do at high
+   // verbosity
