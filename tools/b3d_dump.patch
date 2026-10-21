@@ -61,6 +61,47 @@ index fa9e6da..3c6bc4d 100644
  
    // TODO: This does nontrivial computation. Only do at high
    // verbosity.
+diff --git a/src/lambda_log_r_tables/lambda_log_r_deriv/lambda_log_r_deriv.cxx b/src/lambda_log_r_tables/lambda_log_r_deriv/lambda_log_r_deriv.cxx
+index 8e6e5cf..aeb11fa 100644
+--- a/src/lambda_log_r_tables/lambda_log_r_deriv/lambda_log_r_deriv.cxx
++++ b/src/lambda_log_r_tables/lambda_log_r_deriv/lambda_log_r_deriv.cxx
+@@ -1,4 +1,5 @@
+ #include "Delta_Fraction.hxx"
++#include "../../dump.hxx"
+ #include "../Cache.hxx"
+ #include "../../Log_r_Derivatives.hxx"
+ #include "../../Q4pm.hxx"
+@@ -175,6 +176,30 @@ lambda_log_r_deriv(const std::array<int64_t, 4> &two_js,
+     }
+ 
+   shift_timer.stop();
++  if(b3d_dump_prefix())
++    {
++      // N two_j pp a b e ncoeffs coeffs... (Log_r_Derivatives numerators in x)
++      std::ofstream os(std::string(b3d_dump_prefix()) + "_N" + std::to_string(n)
++                       + ".txt");
++      b3d_set_precision(os);
++      size_t ji(0);
++      for(auto &two_j : two_js_intermediate)
++        {
++          for(size_t pp(0); pp != result[ji].size(); ++pp)
++            for(size_t a(0); a != result[ji][pp].size(); ++a)
++              for(size_t b(0); b != result[ji][pp][a].size(); ++b)
++                for(size_t e(0); e != result[ji][pp][a][b].numerator.size(); ++e)
++                  {
++                    auto &poly(result[ji][pp][a][b].numerator[e]);
++                    os << "N " << two_j << " " << pp << " " << a << " " << b << " "
++                       << e << " " << poly.size();
++                    for(size_t c(0); c != poly.size(); ++c)
++                      os << " " << poly[c];
++                    os << "\n";
++                  }
++          ++ji;
++        }
++    }
+   all_timer.stop();
+   timers.exit();
+   return result;
 diff --git a/src/lambda_log_r_tables/lambda_log_r_tables.cxx b/src/lambda_log_r_tables/lambda_log_r_tables.cxx
 index 8bd218e..c895d3a 100644
 --- a/src/lambda_log_r_tables/lambda_log_r_tables.cxx
