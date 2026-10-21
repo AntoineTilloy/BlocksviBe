@@ -27,6 +27,7 @@ does GPU work and can be called for any number of right-hand-side batches.
 from fractions import Fraction
 import time
 import mpmath as mp
+import numpy as np
 import torch
 
 from . import structure as S
@@ -80,122 +81,237 @@ def _expand(A, shape):
     return mpf.MPF(A.m.expand(A.L, *shape).contiguous(), A.e.expand(*shape).contiguous())
 
 
+class _Offsets:
+    """offset[(m, jidx)]: first logical slot of spin jidx at level m"""
+
+    def __init__(self, start, flat):
+        self.start, self.flat = start, flat
+
+    def __getitem__(self, key):
+        return int(self.flat[self.start[key[0]] + key[1]])
+
+
+def _first_rank(codes):
+    """index of each code's value in order of first appearance (dict-insertion order), and the values"""
+    uniq, first, inv = np.unique(codes, return_index=True, return_inverse=True)
+    order = np.argsort(first, kind="stable")
+    rank = np.empty(len(uniq), dtype=np.int64)
+    rank[order] = np.arange(len(uniq))
+    return rank[inv.reshape(-1)], uniq[order]
+
+
 class Plan:
-    """CPU-side index plan of the recursion for one operator (depends on no number)."""
+    """CPU-side index plan of the recursion for one operator (depends on no number).  Vectorised (numpy):
+    builds exactly the tensors of the original per-task builder (plan_ref.PlanRef, tests/test_blocks_plan.py),
+    except that the per-level Cauchy tables are kept as row/column pole positions (rowd/nrow, cold/ncol)
+    and expanded on the GPU when used (cauchy_tables): dense, they would take tens of GB at order 152."""
 
     def __init__(self, two_j12, two_j43, two_j_max, order, pseudo_parities, reuse=False):
         self.tj12, self.tj43, self.tjmax, self.order, self.pp = two_j12, two_j43, two_j_max, order, pseudo_parities
+        tj12, tj43, tjmax = two_j12, two_j43, two_j_max
         self.SL = lambda p, tj: len(S.so3(pseudo_parities[p][0], two_j12, tj))
         self.SR = lambda p, tj: len(S.so3(pseudo_parities[p][1], two_j43, tj))
-        self.Smax = max(max(self.SL(p, tj), self.SR(p, tj)) for p in range(2)
-                        for tj in range(two_j12 % 2, two_j_max + 2 * order + 1, 2))
-        self.Jh = len(S.two_j_values(0, order + 1, two_j12, two_j_max))   # spins of h_inf (as blocks_3d)
-        self.offset, n = {}, 0
+        b = tj12 % 2
+        tj_all = range(b, tjmax + 2 * order + 3, 2)                     # every two_j a task can touch
+        self._SL = np.array([[self.SL(p, tj) for tj in tj_all] for p in range(2)])
+        self._SR = np.array([[self.SR(p, tj) for tj in tj_all] for p in range(2)])
+        nmax = (tjmax + 2 * order - b) // 2 + 1
+        self.Smax = int(max(self._SL[:, :nmax].max(), self._SR[:, :nmax].max()))
+        self.Jh = len(S.two_j_values(0, order + 1, tj12, tjmax))          # spins of h_inf (as blocks_3d)
+        # logical slot layout: (m, jidx, pole) consecutive, parity p adds p * nslots
+        self._tjs, self._ords, self._npol, start, flat, n, nent = [], [], [], [], [], 0, 0
         for m in range(order):
-            for jidx, tj in enumerate(S.two_j_values(m, order, two_j12, two_j_max)):
-                self.offset[(m, jidx)] = n
-                n += len(S.poles(tj, two_j12, two_j43, order - m - S.j_excess(tj, two_j_max)))
+            tjs = np.arange(b, tjmax + 2 * (order - m - 1) + 1, 2, dtype=np.int64)
+            ords = order - m - S.j_excess_v(tjs, tjmax)
+            npol = S.counts_v(tjs, tj12, tj43, ords).sum(0)
+            start.append(nent)
+            nent += len(tjs)
+            flat.append(n + np.concatenate([[0], np.cumsum(npol)[:-1]]) if len(npol) else np.zeros(0, np.int64))
+            n += int(npol.sum())
+            self._tjs.append(tjs); self._ords.append(ords); self._npol.append(npol)
+        self._start = np.array(start, dtype=np.int64)
+        self._flat = np.concatenate(flat) if flat else np.zeros(0, np.int64)
+        self.offset = _Offsets(self._start, self._flat)
         self.nslots = n
         self.zero_slot = 2 * n
-        self.Mkeys, self.Qkeys = {}, {}           # (P, delta, two_jNN, ppp, two_j) / (P, tj, sign) -> index
         self.dmax = 1
-        self.levels = [self._level(m) for m in range(order)]
+        raw = [self._level(m) for m in range(order)]
+        self._keys(raw)
+        self.levels = [None if r is None else r[0] for r in raw]
         self._physical(reuse)
 
-    def _mkey(self, key):
-        return self.Mkeys.setdefault(key, len(self.Mkeys))
+    def _ji(self, tj):
+        return (tj - self.tj12 % 2) // 2
 
     def _level(self, m):
-        tj12, tj43, tjmax, order = self.tj12, self.tj43, self.tjmax, self.order
-        groups = {}
-        tasks = []
-        for jidx, tj in enumerate(S.two_j_values(m, order, tj12, tjmax)):
-            pl = S.poles(tj, tj12, tj43, order - m - S.j_excess(tj, tjmax))
-            for pidx, P in enumerate(pl):
-                tjp = S.pole_two_j(P, tj)
-                dprime = S.delta_2(P, tj) + 2 * S.shift(P)
-                for p in range(2):
-                    src = (p + S.parity(P)) % 2
-                    if not (self.SL(p, tj) and self.SR(p, tj) and self.SL(src, tjp) and self.SR(src, tjp)):
-                        continue
-                    g = groups.get((src, tjp))
-                    if g is None:
-                        jpex = S.j_excess(tjp, tjmax)
-                        cols = [(src * self.nslots + self.offset[(m - S.shift(i), tjp // 2)]
-                                 + S.position(tjp, tj12, tj43, order - m + S.shift(i) - jpex, i),
-                                 S.delta_2(i, tjp)) for i in S.poles(tjp, tj12, tj43, m)]
-                        g = groups[(src, tjp)] = {"rows": {}, "cols": cols, "gi": len(groups)}
-                    r = g["rows"].setdefault(dprime, len(g["rows"]))
-                    sign = -1 if (tjp - tj) % 4 else 1
-                    tasks.append((p * self.nslots + self.offset[(m, jidx)] + pidx, g["gi"], r,
-                                  self._mkey((P, 0, tj12, self.pp[src][0], tj)),
-                                  self._mkey((P, 1, tj43, self.pp[src][1], tj)),
-                                  self.Qkeys.setdefault((P, tj, sign), len(self.Qkeys))))
-        if not groups:
+        tj12, tj43, tjmax, order, ns = self.tj12, self.tj43, self.tjmax, self.order, self.nslots
+        tjs, ords, npol = self._tjs[m], self._ords[m], self._npol[m]
+        tot = int(npol.sum())
+        if tot == 0:
             return None
-        gl = sorted(groups.items(), key=lambda kv: kv[1]["gi"])
-        nb = len(gl)
-        Mr = max(len(g["rows"]) for _, g in gl)
-        Kc = max(1, max(len(g["cols"]) for _, g in gl))
-        col = torch.full((nb, Kc), self.zero_slot, dtype=torch.long)
-        cidx = torch.zeros((nb, Mr, Kc), dtype=torch.long)       # coefficient table index (0 -> zero)
-        cdiff = torch.zeros((nb, Mr, Kc), dtype=torch.int32)     # D' - D_i (coefficient 2/diff; 0 -> zero)
-        for gi, ((src, tjp), g) in enumerate(gl):
-            for c, (slot, di) in enumerate(g["cols"]):
-                col[gi, c] = slot
-            for d, r in g["rows"].items():
-                for c, (_, di) in enumerate(g["cols"]):
-                    diff = d - di
-                    self.dmax = max(self.dmax, abs(diff))
-                    cidx[gi, r, c] = 0 if diff == 0 else (2 * abs(diff) - (1 if diff > 0 else 0))
-                    cdiff[gi, r, c] = diff
-        t = torch.tensor(tasks, dtype=torch.long)
-        return {"m": m, "nb": nb, "Mr": Mr, "Kc": Kc,
-                "gsrc": torch.tensor([k[0] for k, _ in gl]), "gj": torch.tensor([k[1] // 2 for k, _ in gl]),
-                "col": col, "cidx": cidx, "cdiff": cdiff, "t_slot": t[:, 0], "t_hrow": t[:, 1] * Mr + t[:, 2],
-                "t_L": t[:, 3], "t_R": t[:, 4], "t_q": t[:, 5]}
+        jidx = np.repeat(np.arange(len(tjs)), npol)
+        pidx = np.arange(tot) - np.repeat(np.cumsum(npol) - npol, npol)
+        tj = tjs[jidx]
+        t, k = S.pole_at_v(tj, tj12, tj43, ords[jidx], pidx)
+        jidx, pidx, tj, t, k = (np.repeat(a, 2) for a in (jidx, pidx, tj, t, k))   # parity p innermost
+        p = np.tile(np.array([0, 1]), tot)
+        tjp = S.pole_two_j_v(t, k, tj)
+        sh = S.shift_v(t, k)
+        dprime = S.delta_2_v(t, k, tj) + 2 * sh
+        src = (p + (t == 3)) % 2
+        ji, jip = self._ji(tj), self._ji(tjp)
+        keep = ((self._SL[p, ji] > 0) & (self._SR[p, ji] > 0) & (self._SL[src, jip] > 0) & (self._SR[src, jip] > 0))
+        if not keep.any():
+            return None
+        jidx, pidx, tj, t, k, p, tjp, dprime, src = (a[keep] for a in (jidx, pidx, tj, t, k, p, tjp, dprime, src))
+        slot = p * ns + self._flat[self._start[m] + jidx] + pidx
+        # groups (src, tjp) and their rows D' in order of first appearance
+        gi, gkeys = _first_rank(src * (1 << 32) + tjp)
+        nb = len(gkeys)
+        gsrc, gtjp = gkeys >> 32, gkeys & ((1 << 32) - 1)
+        dmin = int(dprime.min())
+        rcode = gi * (1 << 32) + (dprime - dmin)
+        uniq, first, inv = np.unique(rcode, return_index=True, return_inverse=True)
+        ug = uniq >> 32
+        o = np.lexsort((first, ug))                                    # by group, then first appearance
+        cnt = np.bincount(ug, minlength=nb)
+        gstart = np.cumsum(cnt) - cnt
+        r_of = np.empty(len(uniq), dtype=np.int64)
+        r_of[o] = np.arange(len(uniq)) - gstart[ug[o]]
+        r = r_of[inv.reshape(-1)]
+        Mr = int(cnt.max())
+        rowd = np.zeros((nb, Mr), dtype=np.int64)
+        rowd[ug, r_of] = (uniq & ((1 << 32) - 1)) + dmin
+        # columns: poles of tjp at order m, residues of level m - shift
+        ncol = S.counts_v(gtjp, tj12, tj43, m).sum(0)
+        Kc = max(1, int(ncol.max()))
+        cg = np.repeat(np.arange(nb), ncol)
+        cc = np.arange(int(ncol.sum())) - np.repeat(np.cumsum(ncol) - ncol, ncol)
+        ctj = gtjp[cg]
+        ti, ki = S.pole_at_v(ctj, tj12, tj43, m, cc)
+        si = S.shift_v(ti, ki)
+        cslot = (gsrc[cg] * ns + self._flat[self._start[m - si] + ctj // 2]
+                 + S.position_v(ctj, tj12, tj43, order - m + si - S.j_excess_v(ctj, tjmax), ti, ki))
+        col = np.full((nb, Kc), self.zero_slot, dtype=np.int64)
+        col[cg, cc] = cslot
+        cold = np.zeros((nb, Kc), dtype=np.int64)
+        cold[cg, cc] = S.delta_2_v(ti, ki, ctj)
+        if len(cg):
+            cmin = np.full(nb, np.iinfo(np.int64).max); np.minimum.at(cmin, cg, cold[cg, cc])
+            cmax = np.full(nb, np.iinfo(np.int64).min); np.maximum.at(cmax, cg, cold[cg, cc])
+            rmin = np.where(np.arange(Mr)[None] < cnt[:, None], rowd, np.iinfo(np.int64).max).min(1)
+            rmax = np.where(np.arange(Mr)[None] < cnt[:, None], rowd, np.iinfo(np.int64).min).max(1)
+            h = ncol > 0
+            if h.any():
+                self.dmax = max(self.dmax, int(np.abs(rmax[h] - cmin[h]).max()), int(np.abs(rmin[h] - cmax[h]).max()))
+        sign = np.where((tjp - tj) % 4 != 0, -1, 1)
+        ppa = np.array(self.pp)
+        lev = {"m": m, "nb": nb, "Mr": Mr, "Kc": Kc, "gsrc": torch.from_numpy(gsrc), "gj": torch.from_numpy(gtjp // 2),
+               "col": col, "rowd": torch.from_numpy(rowd), "nrow": torch.from_numpy(cnt),
+               "cold": torch.from_numpy(cold), "ncol": torch.from_numpy(ncol), "t_slot": slot,
+               "t_hrow": torch.from_numpy(gi * Mr + r)}
+        return lev, (t, k, tj, ppa[src, 0], ppa[src, 1], sign)
+
+    def _keys(self, raw):
+        """M-matrix and Q keys, indexed in order of first appearance over all levels (L before R per task)"""
+        lv = [x[1] for x in raw if x is not None]
+        if not lv:
+            self.Mkeys, self.Qkeys = {}, {}
+            return
+        t, k, tj, pL, pR, sign = (np.concatenate([x[i] for x in lv]) for i in range(6))
+        KM, TJM = self.order + 2, self.tjmax + 2 * self.order + 4
+        PPM = int(np.array(self.pp).max()) + 1
+        code = lambda d, pq: (((t * KM + k) * 2 + d) * PPM + pq) * TJM + tj
+        idx, uniq = _first_rank(np.stack([code(0, pL), code(1, pR)], 1).reshape(-1))
+        u = uniq
+        tju, u = u % TJM, u // TJM
+        ppu, u = u % PPM, u // PPM
+        du, u = u % 2, u // 2
+        ku, tu = u % KM, u // KM
+        self.Mkeys = {((int(a), int(b)), int(d), self.tj12 if d == 0 else self.tj43, int(c), int(e)): i
+                      for i, (a, b, d, c, e) in enumerate(zip(tu, ku, du, ppu, tju))}
+        qidx, quniq = _first_rank(((t * KM + k) * TJM + tj) * 2 + (sign > 0))
+        u = quniq
+        su, u = u % 2, u // 2
+        tju, u = u % TJM, u // TJM
+        self.Qkeys = {((int(u_ // KM), int(u_ % KM)), int(a), 1 if b else -1): i
+                      for i, (u_, a, b) in enumerate(zip(u, tju, su))}
+        o = 0
+        for x in raw:
+            if x is None:
+                continue
+            lev, n = x[0], len(x[1][0])
+            lev["t_L"] = torch.from_numpy(idx[2 * o:2 * (o + n):2].copy())
+            lev["t_R"] = torch.from_numpy(idx[2 * o + 1:2 * (o + n):2].copy())
+            lev["t_q"] = torch.from_numpy(qidx[o:o + n].copy())
+            o += n
 
     def _physical(self, reuse):
-        """logical -> physical slots (self.phys, born slots only; unborn slots are zero and read as the
-        zero slot).  reuse: greedy recycling of a slot after the level that reads it as a Cauchy column
-        (the gather copies the columns before the pole step writes, so that level may reuse it), or after
-        its own level if it is never read."""
-        z = self.zero_slot
-        born, last = {}, {}
+        """logical -> physical slots (self.phys: -1 for unborn slots, which are zero and read as the zero
+        slot).  reuse: greedy recycling of a slot after the level that reads it as a Cauchy column (the
+        gather copies the columns before the pole step writes, so that level may reuse it), or after its
+        own level if it is never read; same allocation order as the reference builder (LIFO free list)."""
+        z, N = self.zero_slot, 2 * self.nslots
+        born = np.full(N, -1, dtype=np.int64)
+        last = np.full(N, -1, dtype=np.int64)
         for lev in self.levels:
             if lev is None:
                 continue
-            m = lev["m"]
-            for t in lev["t_slot"].tolist():
-                born[t] = m
-            for c in lev["col"].reshape(-1).tolist():
-                if c != z:
-                    last[c] = max(last.get(c, -1), m)
+            born[lev["t_slot"]] = lev["m"]
+            c = lev["col"].reshape(-1)
+            c = c[c != z]
+            np.maximum.at(last, c, lev["m"])
+        phys = np.full(N, -1, dtype=np.int64)
         if not reuse:
-            self.phys, self.nphys = {t: t for t in born}, 2 * self.nslots
+            phys[born >= 0] = np.nonzero(born >= 0)[0]
+            self.nphys = N
         else:
-            self.phys, free, release, n = {}, [], {}, 0
-            for t in sorted(born, key=lambda t: (born[t], t)):
-                m = born[t]
-                for mm in [k for k in release if k <= m]:
-                    free += release.pop(mm)
-                ph = free.pop() if free else n
-                n += ph == n
-                self.phys[t] = ph
-                d = last.get(t, -1)
-                release.setdefault(d if d > m else m + 1, []).append(ph)
+            order = np.argsort(born, kind="stable")
+            order = order[born[order] >= 0]
+            bl = born[order]
+            cuts = np.flatnonzero(np.diff(bl)) + 1
+            free, release, n = np.zeros(0, np.int64), {}, 0
+            for seg in np.split(order, cuts):
+                if not len(seg):
+                    continue
+                m = int(born[seg[0]])
+                pend = [kk for kk in release if kk <= m]
+                if pend:
+                    free = np.concatenate([free] + [np.concatenate(release.pop(kk)) for kk in pend])
+                take = min(len(seg), len(free))
+                ph = np.empty(len(seg), dtype=np.int64)
+                ph[:take] = free[::-1][:take]
+                ph[take:] = n + np.arange(len(seg) - take)
+                n += len(seg) - take
+                free = free[:len(free) - take]
+                phys[seg] = ph
+                d = last[seg]
+                rel = np.where(d > m, d, m + 1)
+                _, fi = np.unique(rel, return_index=True)
+                for kk in rel[np.sort(fi)]:
+                    release.setdefault(int(kk), []).append(ph[rel == kk])
             self.nphys = n
+        self.phys = phys
         self.zero_slot = self.nphys
         for lev in self.levels:
             if lev is None:
                 continue
-            lev["t_slot"] = torch.tensor([self.phys[t] for t in lev["t_slot"].tolist()], dtype=torch.long)
-            lev["col"] = torch.tensor([self.phys.get(c, self.nphys) for c in lev["col"].reshape(-1).tolist()],
-                                      dtype=torch.long).reshape(lev["col"].shape)
+            lev["t_slot"] = torch.from_numpy(phys[lev["t_slot"]])
+            c = lev["col"]
+            ok = c != z
+            pc = np.full(c.shape, self.nphys, dtype=np.int64)
+            pc[ok] = phys[c[ok]]
+            lev["col"] = torch.from_numpy(np.where(pc >= 0, pc, self.nphys))
+
+    def phys_slots(self, logical):
+        """physical slots of logical ones (numpy array; the zero slot where never written)"""
+        logical = np.asarray(logical)
+        ok = logical < len(self.phys)
+        p = self.phys[np.where(ok, logical, 0)]
+        return np.where(ok & (p >= 0), p, self.zero_slot)
 
     def phys_slot(self, logical):
-        """physical slot of a logical one (the zero slot if it is never written)"""
-        return self.phys.get(logical, self.zero_slot)
+        return int(self.phys_slots(np.array([logical]))[0])
 
     def counts(self):
         """output entries of the Cauchy and pole steps per right-hand side (rows padded per level,
@@ -203,6 +319,17 @@ class Plan:
         h = sum(lev["nb"] * lev["Mr"] for lev in self.levels if lev) * self.Smax ** 2
         r = sum(len(lev["t_slot"]) for lev in self.levels if lev) * self.Smax ** 2
         return h, r
+
+
+def cauchy_tables(lev):
+    """per-level Cauchy tables from the row/column pole positions: cdiff = D' - D_i (int32, 0 for padding
+    and for coinciding positions) and cidx (index into the table of +-2/k: 0 -> zero, 2k-1 -> +2/k, 2k -> -2/k)"""
+    rowd, cold = lev["rowd"], lev["cold"]
+    vr = torch.arange(lev["Mr"], device=rowd.device)[None] < lev["nrow"][:, None]
+    vc = torch.arange(lev["Kc"], device=cold.device)[None] < lev["ncol"][:, None]
+    diff = torch.where(vr[:, :, None] & vc[:, None, :], rowd[:, :, None] - cold[:, None, :], 0)
+    cidx = torch.where(diff == 0, 0, 2 * diff.abs() - (diff > 0).long())
+    return diff.to(torch.int32), cidx
 
 
 class Recursion:
@@ -266,10 +393,11 @@ class Recursion:
             Hi = _expand(Hi.reshape(nb, 1, S2 * B), (nb, Mr, S2 * B))
             if m > 0:
                 X = _take(res, lev["col"]).reshape(nb, Kc, S2 * B)
+                cdiff, cidx = cauchy_tables(lev)
                 if self.cauchy == "cuda" or (self.cauchy == "auto" and Kc <= self.kcut):
-                    H = mpf.add(cauchy_kernel(X, lev["cdiff"]), Hi)
+                    H = mpf.add(cauchy_kernel(X, cdiff), Hi)
                 else:
-                    C = _take(self.Ctab, lev["cidx"])                                 # (nb, Mr, Kc)
+                    C = _take(self.Ctab, cidx)                                        # (nb, Mr, Kc)
                     H = mpf.add(bgemm(C, X), Hi)
             else:
                 H = Hi

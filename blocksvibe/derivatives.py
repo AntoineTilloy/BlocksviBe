@@ -146,23 +146,34 @@ class Derivs:
         self.poles = [S.poles(tj, tj12, tj43, order) for tj in self.tjs]
         NP = self.NP = max(len(p) for p in self.poles)
         self.Dout = NP + R + 1
-        jo_of = {tj: jo for jo, tj in enumerate(self.tjs)}
         # moment rows ((p * Jo + jo) * NP + i), per level: (physical slot, row, n = m + s_i)
+        tjo = np.array(self.tjs, dtype=np.int64)
         self.levels = []
         for m in range(order):
-            sl, rw, nn = [], [], []
-            for jidx, tj in enumerate(S.two_j_values(m, order, tj12, tjmax)):
-                jo = jo_of.get(tj)
-                if jo is None:
-                    continue
-                for pidx, P in enumerate(S.poles(tj, tj12, tj43, order - m - S.j_excess(tj, tjmax))):
-                    i = S.position(tj, tj12, tj43, order, P)
-                    for p in range(2):
-                        ph = pl.phys_slot(p * pl.nslots + pl.offset[(m, jidx)] + pidx)
-                        if ph != pl.zero_slot:
-                            sl.append(ph); rw.append((p * Jo + jo) * NP + i); nn.append(m + S.shift(P))
-            self.levels.append(None if not sl else (torch.tensor(sl, device=dev), torch.tensor(rw, device=dev),
-                                                    torch.tensor(nn, dtype=torch.int32, device=dev)))
+            tjs = pl._tjs[m]
+            jsel = np.flatnonzero(np.isin(tjs, tjo))
+            jo = np.searchsorted(tjo, tjs[jsel]) if np.all(np.diff(tjo) > 0) else \
+                np.array([self.tjs.index(int(x)) for x in tjs[jsel]], dtype=np.int64)
+            npol = pl._npol[m][jsel]
+            tot = int(npol.sum())
+            if tot == 0:
+                self.levels.append(None)
+                continue
+            rep = np.repeat(np.arange(len(jsel)), npol)
+            pidx = np.arange(tot) - np.repeat(np.cumsum(npol) - npol, npol)
+            jidx, tj, jo_ = jsel[rep], tjs[jsel][rep], jo[rep]
+            t, k = S.pole_at_v(tj, tj12, tj43, pl._ords[m][jidx], pidx)
+            i = S.position_v(tj, tj12, tj43, order, t, k)
+            nn = m + S.shift_v(t, k)
+            jidx, pidx, jo_, i, nn = (np.repeat(a, 2) for a in (jidx, pidx, jo_, i, nn))
+            p = np.tile(np.array([0, 1]), tot)
+            ph = pl.phys_slots(p * pl.nslots + pl._flat[pl._start[m] + jidx] + pidx)
+            ok = ph != pl.zero_slot
+            if not ok.any():
+                self.levels.append(None)
+                continue
+            self.levels.append((torch.from_numpy(ph[ok]).to(dev), torch.from_numpy(((p * Jo + jo_) * NP + i)[ok]).to(dev),
+                                torch.from_numpy(nn[ok].astype(np.int32)).to(dev)))
         self._constants()
 
     def _constants(self):

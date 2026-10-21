@@ -81,3 +81,47 @@ def cauchy_coeff(dprime_2, pole_delta_2):
     """+-2/|diff| as in fill_residues (0 if the difference vanishes)"""
     diff = dprime_2 - pole_delta_2
     return Fraction(0) if diff == 0 else Fraction(2, diff)
+
+
+# ---------------------------------------------------------------- vectorised versions (numpy int64 arrays)
+import numpy as _np
+
+
+def counts_v(tj, tj12, tj43, order):
+    """number of poles of each type: int64 array (4, *shape) (pole_range_k, clipped at 0)"""
+    tj, order = _np.broadcast_arrays(_np.asarray(tj, _np.int64), _np.asarray(order, _np.int64))
+    bos = tj % 2 == 0
+    h, o2, o21 = tj // 2, order // 2, (order + 1) // 2
+    small = _np.minimum(h, min(tj12 // 2, tj43 // 2))
+    c = _np.stack([order, _np.minimum(h, order), _np.where(bos, o2, _np.minimum(small, o2)),
+                   _np.where(bos, _np.minimum(small, o21), o21)])
+    return _np.maximum(c, 0)
+
+
+def pole_at_v(tj, tj12, tj43, order, idx):
+    """(type, k) of the idx-th pole of poles(tj, ., ., order)"""
+    tj, order, idx = _np.broadcast_arrays(*[_np.asarray(a, _np.int64) for a in (tj, order, idx)])
+    c = _np.cumsum(counts_v(tj, tj12, tj43, order), 0)
+    t = (idx >= c[0]).astype(_np.int64) + (idx >= c[1]) + (idx >= c[2])
+    start = _np.where(t == 0, 0, _np.take_along_axis(c, _np.maximum(t - 1, 0)[None], 0)[0])
+    return t, idx - start + 1
+
+
+def position_v(tj, tj12, tj43, order, t, k):
+    tj, order, t, k = _np.broadcast_arrays(*[_np.asarray(a, _np.int64) for a in (tj, order, t, k)])
+    c = _np.cumsum(counts_v(tj, tj12, tj43, order), 0)
+    start = _np.where(t == 0, 0, _np.take_along_axis(c, _np.maximum(t - 1, 0)[None], 0)[0])
+    return start + k - 1
+
+
+def shift_v(t, k): return _np.where(t < 2, k, _np.where(t == 2, 2 * k, 2 * k - 1))
+
+
+def pole_two_j_v(t, k, tj): return _np.where(t == 0, tj + 2 * k, _np.where(t == 1, tj - 2 * k, tj))
+
+
+def delta_2_v(t, k, tj):
+    return _np.choose(t, [2 - tj - 2 * k, 4 + tj - 2 * k, 3 - 2 * k, 4 - 2 * k])
+
+
+def j_excess_v(tj, two_j_max): return _np.where(tj > two_j_max, (tj - two_j_max) // 2, 0)
