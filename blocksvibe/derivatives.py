@@ -35,7 +35,7 @@ import numpy as np
 import torch
 
 from . import structure as S
-from .recursion_gpu import bgemm, _take, _expand, _permute
+from .recursion_gpu import bgemm, _take, _expand, _permute, _tick
 from .. import mpf
 from ..rns import dev
 
@@ -179,17 +179,13 @@ class Derivs:
         for d in d2:
             D = Fraction(d, 2)
             tab += [comb(e, k) * D ** (e - k) if k <= e else 0 for e in range(R + 1) for k in range(R + 1)]
-        Ttab = _dyadic(tab, L, (len(d2) + 1, R + 1, R + 1))
+        self.Ttab = _dyadic(tab, L, (len(d2) + 1, R + 1, R + 1))
         didx = torch.zeros((Jo, NP), dtype=torch.long)
         for jo, (tj, pl) in enumerate(zip(self.tjs, self.poles)):
             for i, P in enumerate(pl):
                 didx[jo, i] = di[S.delta_2(P, tj)]
-        didx = didx.to(dev)
-        self.T = _take(Ttab, didx.reshape(-1))                        # (Jo NP, R+1, R+1): C(e,d) D_i^(e-d)
+        self.didx = didx.to(dev)                                      # T, Vand gathered per spin chunk
         Rw = max(R, 1)
-        V = _take(Ttab, didx)                                         # (Jo, NP, R+1, R+1); [.., w, 0] = D^w
-        self.Vand = mpf.MPF(V.m[:, :, :, :Rw, 0].permute(0, 1, 3, 2).contiguous(),
-                            V.e[:, :, :Rw, 0].permute(0, 2, 1).contiguous())   # (Jo, Rw, NP)
         # P_e[t] = C(e,t) c[e-t] + sum_{u=t+1}^{e} C(e,u) G[e-u][u-t-1];  inputs: c[d] (R+1), G[d][w] (Rw x (R+1), w major)
         Kin = (R + 1) + Rw * (R + 1)
         A = np.zeros(((R + 1) * (R + 1), Kin), dtype=object)
@@ -244,13 +240,21 @@ class Derivs:
                          cp.from_dlpack(rw), cp.from_dlpack(self.mom.m), cp.from_dlpack(self.mom.e),
                          np.int64(T), np.int64(self.N), np.int64(self.mom.shape[0]), np.int32(self.R + 1)))
 
+    def offload(self):
+        """move the finished moments to pinned host memory (finish_iter streams them back per spin chunk):
+        frees GPU memory for the final GEMMs on small cards"""
+        self.mom = mpf.MPF(self.mom.m.cpu().pin_memory(), self.mom.e.cpu().pin_memory())
+
     def finish(self, h_inf, chunk=None):
         """h_inf: MPF (2, order + 1, Jh, Smax^2, B).  Returns numerators MPF (Jo, Dout, R+1, 2, Smax^2, B):
         [spin, x^k coefficient, log r derivative e, parity, structure a*Smax+b, rhs]"""
         return _cat([num for _, num in self.finish_iter(h_inf, chunk)], 0)
 
-    def finish_iter(self, h_inf, chunk=None):
-        """as finish, by chunks of output spins (bounded temporaries): yields (first spin index, numerators)"""
+    def finish_iter(self, h_inf, chunk=None, prof=None):
+        """as finish, by chunks of output spins (bounded temporaries): yields (first spin index, numerators).
+        prof: dict accumulating GPU seconds per stage"""
+        tick = (lambda k: _tick(prof, k)) if prof is not None else (lambda k: None)
+        tick(None)
         R, Jo, NP, order = self.R, self.Jo, self.NP, self.plan.order
         N, Rw = self.N, max(R, 1)
         S2 = self.plan.Smax ** 2
@@ -260,20 +264,35 @@ class Derivs:
         H = _permute(H, (1, 2, 0, 3, 4)).reshape(order + 1, Jo * Nc)
         c = mpf.gemm(self.Wh, H).reshape(R + 1, Jo, Nc)                                  # c[d]
         c = _permute(c, (1, 0, 2))                                                       # (Jo, R+1, Nc)
+        tick("h_inf part")
         mom = self.mom.reshape(2, Jo, NP, R + 1, N)
         chunk = chunk or Jo
         for j0 in range(0, Jo, chunk):
             j1 = min(Jo, j0 + chunk)
             J = j1 - j0
-            v = _permute(mom[:, j0:j1], (1, 2, 3, 0, 4)).reshape(J, NP, R + 1, Nc)       # v_i[d]
-            a = bgemm(self.T[j0 * NP:j1 * NP], v.reshape(J * NP, R + 1, Nc)).reshape(J, NP, R + 1, Nc)  # a_i[e]
-            G = bgemm(self.Vand[j0:j1], v.reshape(J, NP, (R + 1) * Nc)).reshape(J, Rw * (R + 1), Nc)  # G[w][d]
+            v = mom[:, j0:j1]
+            if v.m.device != dev:
+                v = mpf.MPF(v.m.to(dev), v.e.to(dev))
+            v = _permute(v, (1, 2, 3, 0, 4)).reshape(J, NP, R + 1, Nc)                   # v_i[d]
+            tick("moments in")
+            T = _take(self.Ttab, self.didx[j0:j1].reshape(-1))                        # (J NP, e, d): C(e,d) D_i^(e-d)
+            a = bgemm(T, v.reshape(J * NP, R + 1, Nc)).reshape(J, NP, R + 1, Nc)         # a_i[e]
+            tick("residues a")
+            T = T.reshape(J, NP, R + 1, R + 1)                                           # [.., w, 0] = D_i^w
+            Vand = mpf.MPF(T.m[:, :, :, :Rw, 0].permute(0, 1, 3, 2).contiguous(),
+                           T.e[:, :, :Rw, 0].permute(0, 2, 1).contiguous())             # (J, Rw, NP)
+            del T
+            G = bgemm(Vand, v.reshape(J, NP, (R + 1) * Nc)).reshape(J, Rw * (R + 1), Nc)  # G[w][d]
             del v
+            tick("G")
             X = _permute(_cat([c[j0:j1], G], 1), (1, 0, 2)).reshape(-1, J * Nc)
             del G
             P = mpf.gemm(self.Apoly, X).reshape(R + 1, R + 1, J, Nc)                    # (e, t, jo, col)
             P = _permute(P, (2, 1, 0, 3)).reshape(J, R + 1, (R + 1) * Nc)               # (jo, t, e col)
+            tick("polynomial part")
             Bn = _cat([P, a.reshape(J, NP, (R + 1) * Nc)], 1)                            # (jo, t | i, e col)
             del P, a, X
+            tick("layout")
             num = bgemm(self.Anum[j0:j1], Bn)                                            # (J, Dout, (R+1) Nc)
+            tick("numerators")
             yield j0, num.reshape(J, self.Dout, R + 1, 2, S2, self.B)
