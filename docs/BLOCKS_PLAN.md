@@ -68,6 +68,12 @@ vast.ai: Threadripper 3960X + RTX 3090, 2026-10-20); everything else is labelled
    16-20).  **4.3 s per right-hand side on the laptop A3000 at the nmax=10 shape vs 211 core-s for the
    same blocks_3d stages** (A3000 ~ 50 cores, ~40-55 at order 30; a 3090 should be ~3x faster,
    estimate), with residue slots recycled after their last use (42% of the slots at order 60).
+   **And write_output (xt, xt_radial) plus a vectorised plan builder (2026-10-21)**: the whole blocks_3d
+   chain after h_inf now runs on the GPU and matches blocks_3d's JSON to its working precision (2^-508.7
+   at 512 bits).  **Measured end to end per right-hand side: order 52 / Lambda 19: 266 core-s
+   (blocks_3d, 1 thread) vs 4.28 s on the A3000 (62 cores) and 1.66 s on a 3090 (160 cores); nmax=10
+   shape 2.06 s, nmax=22 shape ~17.5 s on a 3090 (~200 cores, i.e. ~7 h of one 3090 per nmax=22 point,
+   ~$1.5)**; plan builder 0.4 s at order 60 (was 265 s), 6.3 s at order 152 (section 6).
 
 5. **Haskell side** (section 7): ttoBlock/tsMixedBlock are JSON-parse bound (~50 us per 240-byte
    number, files re-read 3x), partChunk is dominated by an O(D^2) Horner polynomial shift x -> x+1e-6 per
@@ -171,7 +177,17 @@ benchmark `tools/blocks/bench_derivs.py`.
 
 * Plan (CPU, once per operator): slot layout of all residues (slot = parity, level, spin, pole), per level
   the (src, j') groups with their Cauchy rows D' and columns (prime poles), and per task the indices of
-  its H row, L/R matrices and Q.  (Python; 140-200 s at order 60 -- to be moved to C++/vectorised.)
+  its H row, L/R matrices and Q.  **Vectorised (numpy) since 2026-10-21**, identical tensors to the first
+  per-task Python builder (kept as `plan_ref.PlanRef`; `tests/test_blocks_plan.py`, 7 cases incl. odd
+  two_j12, with and without slot reuse); the per-level Cauchy tables are kept as row/column pole positions
+  and expanded on the GPU per level (dense they would be 13.9 GB at order 152).  2j12 = 2j43 = 8, slot
+  reuse (`bench_plan.py`, laptop / 3090 box):
+
+  | order, j_max | build | peak RSS | index tensors | tasks | physical slots | derivative constants (R) |
+  |---|---|---|---|---|---|---|
+  | 60, 60 | 0.4 s (was ~265 s) | 0.8 GB | 0.05 GB | 0.70 M | 0.29 M | 1.8 s (19) |
+  | 130, 90 | 4.5 s | 1.8 GB | 0.35 GB | 5.1 M | 2.1 M | 8.9 s (43) |
+  | 152, 100 | 6.3 s | 2.4 GB | 0.53 GB | 7.8 M | 3.3 M | 13 s (51), 1.9 GB on the GPU at 896 bits |
 * Constants (GPU, once per operator): table of all M matrices, Q values (exact rationals, sign folded
   in), table of 2/k.
 * Per level: (1) gather the prime-pole residues X (nb x K x S^2 B); **Cauchy step** H = C X + h_inf with
@@ -190,6 +206,35 @@ benchmark `tools/blocks/bench_derivs.py`.
   its physical slot is recycled after that level (or after its own level if it is never read; the
   derivative moments are taken right after the level that produces it).  Physical slots: 4,062 of
   10,134 at order 16, 294,860 of 699,214 (42%) at order 60, j_max 60, 2j12 = 2j43 = 8.
+
+### write_output (`output.py`)
+
+blocks_3d's coordinate conversion of the numerators for xt and xt_radial (what the stress-tensor programs
+use): lambda_lr_to_lrho_lrhob, congruence transforms with stirling, rho_z and (Delta_1+2 != 0)
+power_prefactor, zzb_to_xt; lrho_to_xt_radial.  All are scalar linear maps acting on each x^k coefficient,
+and the three transforms are lower triangular, so blocks_3d's truncations to the stored triangle i + j <= O
+never drop a term: zzb = M F M^T with M = P R_z S, and an input (lambda order n, log r derivative e) only
+feeds the antidiagonal i + j = n + e of F.  The composite (outputs x inputs, e.g. 110 x 110 at Lambda 19,
+506 x 506 at Lambda 43) is built once per (Lambda, parity, Delta_1+2) in mpmath (2 s at Lambda 19, 49-69
+s at Lambda 43; shared by all tasks of a run) and applied to all spins, structures, coefficients and
+tasks as one RNS GEMM.  `write_json` writes blocks_3d's per-spin JSON layout (incl. its trailing-
+coefficient truncation).  A task's lambda orders can run one at a time (`Derivs.for_order` shares the
+R_max constants as slices; `output.apply_per_order`).
+
+Validation, end to end (`check_output.py`: GPU recursion from blocks_3d's dumped M and h_inf ->
+numerators -> write_output -> JSON, compared per spin, structure, coordinate and derivative with blocks_3d's
+JSON), TTTT j12 = j43 = 2:
+
+| task | blocks_3d precision | output polynomials | max error / largest coefficient |
+|---|---|---|---|
+| q4 (1,2,1,0), sign +1, order 16, Lambda 7, Delta_1+2 = 2.3, xt + xt_radial | 256 bits | 3,444 | 2^-252.5 |
+| same, sign -1 (parity 1), xt / xt_radial (separate runs) | 256 bits | 1,968 / 861 | 2^-252.5 / 2^-252.5 |
+| q4 (2,1,0,1), sign +1, order 20, Lambda 11, Delta_1+2 = 6, xt + xt_radial (also one lambda order at a time) | 512 bits | 8,046 | **2^-508.7** |
+
+i.e. blocks_3d's own precision (the 512-bit case shows the 256-bit residual is blocks_3d's rounding).
+`tests/test_blocks_output.py`: vs a literal mpmath port of blocks_3d's functions, 2^-315 at 318 bits.
+(Side finding: blocks_3d fails with "Unable to find transform for order=Lambda-1" when asked for xt and
+xt_radial together with four_pt_sign = -1: the radial transform's order is never inserted.)
 
 ### Post-recursion stages (`derivatives.py`)
 
@@ -318,15 +363,48 @@ on the A3000 at K = 384, ~3x that on a 3090), against GMP loops with temporaries
 the coordinate transforms are now ported (above), and the output should go to composites/PMP pieces
 directly instead of ~TB of JSON.
 
-What this means per point (blocks part only; Haskell section 7; GPU numbers assume all blocks_3d stages
-ported at the recursion's ratio):
+**Full chain, measured 2026-10-21** (`bench_chain.py`, `bench_output.py`; synthetic operator of the shape
+of a TTTT task, 2j12 = 2j43 = 8, xt, one task = all its lambda orders, run one lambda order at a time
+(B = 1), numerators staged on disk between the stages (staging not counted); blocks_3d native +
+jemalloc, one thread, same shape, Delta_1+2 = 6, its stage timers).  Per right-hand side (one task, one
+lambda order; averages over the task's lambda orders):
 
-| | CPU now (their stats) | rented CPUs ($0.005-0.01/core-h) | 1 RTX 3090, ratio 300 / 800 | 3x 3090 home box |
+| stage | blocks_3d, order 52, j_max 52, Lambda 19, 896 bits (core-s) | A3000, same shape, 926 bits | RTX 3090, same | RTX 3090, order 60, j_max 60, Lambda 19 (nmax=10) | RTX 3090, order 130, j_max 90, Lambda 43, 862 bits (nmax=22) |
+|---|---|---|---|---|---|
+| init (per task in blocks_3d; per operator on the GPU) | 2.1 (21 per task) | plan + constants 3.0 s per operator | 4.2 s | 5.1 s | 22 s + 69 s write_output map (per run) |
+| h_inf | 2.3 | not ported (blocks_3d's, dumped) | | | |
+| recursion | 73.6 | 1.64 | 0.57 | 0.87 | 8.35 |
+| derivatives (moments + numerators) | 23.6 + 47.4 (shift) | 0.62 + 1.59 | 0.20 + 0.55 | 0.30 + 0.62 | 3.1 + 4.1 (avg.; 5.5 + 12.7 at R=43) |
+| write_output | 121.4 (incl. 7.5 GB of JSON per task) | 0.43 (GEMM only) | 0.33 | 0.27 | 1.9 |
+| **total (without init, h_inf)** | **266** | **4.28** (= 62 cores) | **1.66** (= 160 cores) | **2.06** | **~17.5** |
+| peak GPU memory | | 2.35 GB (moments offloaded) | 2.6 GB | 3.3 GB | 19 GB |
+
+The laptop holds order 52 at most at Lambda 19 (order 56 runs out of memory next to the desktop's ~3.4 GB;
+the nmax=10 shape, order 60, needs ~3.3 GB).  The order-130 figures are lambda orders n = 0, 22, 42 measured
+(recursion 8.3-8.4 s each, moments 5.5 / 3.0 / 0.7 s, numerators 12.7 / 2.5 / 0.4 s) and averaged over the
+22 lambda orders by linear / quadratic fits in R; write_output from `bench_output.py`.  On a 24 GB card
+order 130 runs at B = 1 only (19 GB).  The numerator stage at R = 43 (12.7 s) is ~5x what its GEMM MAC
+count predicts and the moments kernel is memory-bound (section above): both are the next profiling targets,
+with the warp-cooperative pole step and residue tables for the Cauchy step (sections 6, 8).
+
+What this means per point (blocks part only; Haskell section 7).  CPU per right-hand side from their
+statistics: TTTe at nmax=22 = 980 core-h / (45 tasks x 22 lambda orders) = ~3,600 core-s (smaller
+structures than the 2j12 = 2j43 = 8 shape timed above, which is therefore an upper bound for the GPU);
+blocks_3d's own stage split at order 52 (above) has the post-recursion stages and JSON at 2.6x the
+recursion.  With ~17.5 s per right-hand side at nmax=22 on a 3090 (B = 1, current kernels): **one 3090 ~
+200 CPU cores for the whole blocks_3d chain** at nmax=22 (160 at order 52, measured end to end; estimates
+below are +-1.5x).
+
+| | CPU now (their stats) | rented CPUs ($0.005-0.01/core-h) | 1 RTX 3090 (~$0.2/h), measured chain, ratio ~200 | 3x 3090 home box |
 |---|---|---|---|---|
-| nmax=22 per point | 1.5k core-h | $7-15 | 5 h / 1.9 h ($1 / $0.4) | 80 points: 5.5 / 2 days |
-| nmax=26 per point | 3.6k core-h | $18-36 | 12 h / 4.5 h | |
-| nmax=26 TTTT (once) | 18.4k core-h | $90-180 | 60 h / 23 h | |
+| nmax=22 per point | 1.5k core-h | $7-15 | ~7 h (~$1.5) | 80 points: ~8 days |
+| nmax=26 per point | 3.6k core-h | $18-36 | ~13-18 h (order 152 not measured) | |
+| nmax=26 TTTT (once) | 18.4k core-h | $90-180 | ~70-90 h | |
 | 24-core home CPU only, nmax=22 | 62 h per point | | | 80 points: ~200 days |
+
+Each of the next kernel steps (pole step 3-5x, moments ~5x, numerator-stage profiling, Cauchy residue
+tables) targets one stage of the order-130 row; together ~2-3x on the chain (ratio ~400-600, estimate).  A
+48-96 GB card also allows B = 2-4 at nmax=22, which halves the GEMM-bound stages (numerators, write_output).
 
 For comparison, the SDP solve of one nmax=22 point on a 3090 is ~10-60 h (SOTA_PLAN.md: 1900-2600 s
 per iteration, 20-90 iterations): with GPU blocks, problem generation becomes a minor part of the GPU time; without them it is the bottleneck by
@@ -392,8 +470,9 @@ In order of value per effort.  Effort figures are rough.
 3. **Hyperion/Haskell** (2-5 days; section 7): shared store for point-independent tables and chunks,
    parse once and in C, shift once.  ~725 -> ~100 core-h per point at nmax=26.
 4. **GPU block engine** (2-4 weeks, in `sdpvibe/blocks/`), driven by the plan/kernels prototyped here:
-   * production plan builder (vectorised or C++; the Python plan takes minutes at order 60) and
-     constants from blocks_3d's own init (via the dump patch, or a small C++ library entry point);
+   * production plan builder -- **done 2026-10-21** (vectorised, 6.3 s at order 152) -- and constants
+     (M matrices, h_inf) from blocks_3d's own init (via the dump patch, or a small C++ library entry
+     point; h_inf is the one blocks_3d stage not ported, 2.3 core-s per right-hand side at order 52);
    * memory: free Cauchy columns after use and accumulate derivative moments on the fly (section 5)
      -- **done 2026-10-21** (`Plan(reuse=True)`, `Derivs.accumulate`); B = 1-2 right-hand sides per
      24 GB card at nmax=22-26, or host-RAM streaming for larger B (the moments can already be moved to
@@ -404,10 +483,11 @@ In order of value per effort.  Effort figures are rough.
      validated against blocks_3d; next: the moments kernel and small-K steps of section 6, pole shifting
      if kept_pole_order < order is ever needed, and write_output's coordinate transforms, which are
      fixed linear maps on the numerators too);
-   * output straight into composite blocks / PMP pieces (no JSON), validated against blocks_3d JSON for
-     a few tasks and against SDPB results at nmax=6-10;
-   * expected: per point ~2-5 h of one 3090 at nmax=22 (vs 1.5k core-h), TTTT at nmax=26 ~1-2.5 days
-     of one 3090 (vs 18k core-h).
+   * write_output -- **done 2026-10-21** (xt, xt_radial; blocks_3d-compatible JSON writer, validated);
+     next: output straight into composite blocks / PMP pieces (no JSON; blocks_3d's write_output with
+     JSON is 46% of its time at order 52), validated against SDPB results at nmax=6-10;
+   * measured chain (section 6): ~7 h of one 3090 per nmax=22 point (vs 1.5k core-h), TTTT at nmax=26
+     ~3-4 days of one 3090 (vs 18k core-h); ~2-3x less with the kernel work above.
 5. **Precision experiment** (cheap, any time): blocks at reduced precision (e.g. 300-500 bits instead of
    832), padded, and compare SDPB's verdicts/functionals at nmax=6-14.  If the bounds do not move, GPU
    block costs drop ~2-3x (the kernels cost ~L to ~L^2 in the number of limbs; blocks_3d itself only
@@ -423,5 +503,10 @@ slow there), an end-to-end GPU-generated PMP.  RTX 3090 rental for these tests: 
 Added 2026-10-21 (laptop only, no rental): GPU post-recursion stages validated against blocks_3d's
 numerators (orders 16-20) and timed at orders 30 and 60 against single-threaded blocks_3d (jemalloc);
 not measured: these stages on a 3090, at B > 1 at order 60, or at production orders.
+Added later on 2026-10-21: vectorised plan builder (identical tensors), write_output on the GPU validated
+against blocks_3d's JSON, full chain timed on the laptop (order 52) against single-threaded blocks_3d and
+on a rented RTX 3090 (orders 52, 60, 130; EPYC 7K62 box, 0.53 h, $0.12, so $0.63 in total for these tests).
+Not measured: order 152 chain, B > 1 at production orders, h_inf on the GPU, an end-to-end GPU-generated PMP.
+Raw logs: results/vast_chain/ (not in the repository).
 Raw logs of the rental are not in the repository (results/ is ignored); the numbers above are copied
 from them.

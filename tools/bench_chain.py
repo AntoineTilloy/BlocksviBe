@@ -35,8 +35,8 @@ print(f"2j12={tj12} 2j43={tj43} j_max={jmax} order={order} Lambda={Lam} L={L} ({
 Sm = plan.Smax
 h = RG.random_mpf((2, order + 1, plan.Jh, Sm * Sm, 1), L)
 peak = 0
-for rep in range(2):                                   # pass 0: compile kernels on the last (cheapest) n
-    for n in (run_ns[-1:] if rep == 0 else run_ns):
+for rep in range(2):                                   # pass 0: compile the kernels (Triton specialises per GEMM shape)
+    for n in run_ns:
         Tn = dict(T)
         der = ders[n]
         torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats()
@@ -72,14 +72,18 @@ if only:
 Jo = der0.Jo
 del rec, ders, der0, der                               # write_output needs none of the recursion's state
 torch.cuda.empty_cache()
+load = lambda j0: [(np.load(f"{stage}/n{n}_j{j0}_m.npy"), np.load(f"{stage}/n{n}_j{j0}_e.npy")) for n in ns]
+spin = lambda nums, j: [mpf.MPF(torch.from_numpy(m[:, j:j + 1]).to(RG.dev), torch.from_numpy(e[j:j + 1]).to(RG.dev))
+                        for m, e in nums]
+OUT.apply_per_order(out, spin(load(0), 0))            # warm-up: compile the write_output GEMM shapes
 nout = 0
 for j0 in range(0, Jo, chunk):
     t = time.time()
-    nums = [(np.load(f"{stage}/n{n}_j{j0}_m.npy"), np.load(f"{stage}/n{n}_j{j0}_e.npy")) for n in ns]
+    nums = load(j0)
     t = tick("staging (disk)", t)
     for j in range(nums[0][1].shape[0]):               # one spin at a time (GEMM working set)
         t = time.time()
-        x = [mpf.MPF(torch.from_numpy(m[:, j:j + 1]).to(RG.dev), torch.from_numpy(e[j:j + 1]).to(RG.dev)) for m, e in nums]
+        x = spin(nums, j)
         t = tick("staging (disk)", t)
         torch.cuda.reset_peak_memory_stats()
         res = OUT.apply_per_order(out, x)
