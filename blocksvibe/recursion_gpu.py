@@ -17,7 +17,10 @@ the batch dimension B, and each level m is
   2. pole step: res = Q L H R^T for every (p, j, P): elementwise multiprecision products and sums
      (S <= 2 j12 + 1 structures), gathered from tables of L/R matrices and Q values.
 
-Residues live in one slot buffer: slot = p * nslots + offset[m][jidx] + pole index, plus a zero slot.
+Residues live in one slot buffer: logical slot = p * nslots + offset[m][jidx] + pole index, plus a zero
+slot.  With Plan(reuse=True) a logical slot is mapped to a physical one that is recycled once the residue
+has been read as a Cauchy column (its only later use; derivative moments are taken right after the
+level, sdpvibe/blocks/derivatives.py): the buffer holds the peak of live residues instead of all of them.
 All index tensors and constants are built once per operator (Plan, Recursion.__init__); run() only
 does GPU work and can be called for any number of right-hand-side batches.
 """
@@ -80,7 +83,7 @@ def _expand(A, shape):
 class Plan:
     """CPU-side index plan of the recursion for one operator (depends on no number)."""
 
-    def __init__(self, two_j12, two_j43, two_j_max, order, pseudo_parities):
+    def __init__(self, two_j12, two_j43, two_j_max, order, pseudo_parities, reuse=False):
         self.tj12, self.tj43, self.tjmax, self.order, self.pp = two_j12, two_j43, two_j_max, order, pseudo_parities
         self.SL = lambda p, tj: len(S.so3(pseudo_parities[p][0], two_j12, tj))
         self.SR = lambda p, tj: len(S.so3(pseudo_parities[p][1], two_j43, tj))
@@ -97,6 +100,7 @@ class Plan:
         self.Mkeys, self.Qkeys = {}, {}           # (P, delta, two_jNN, ppp, two_j) / (P, tj, sign) -> index
         self.dmax = 1
         self.levels = [self._level(m) for m in range(order)]
+        self._physical(reuse)
 
     def _mkey(self, key):
         return self.Mkeys.setdefault(key, len(self.Mkeys))
@@ -151,6 +155,48 @@ class Plan:
                 "col": col, "cidx": cidx, "cdiff": cdiff, "t_slot": t[:, 0], "t_hrow": t[:, 1] * Mr + t[:, 2],
                 "t_L": t[:, 3], "t_R": t[:, 4], "t_q": t[:, 5]}
 
+    def _physical(self, reuse):
+        """logical -> physical slots (self.phys, born slots only; unborn slots are zero and read as the
+        zero slot).  reuse: greedy recycling of a slot after the level that reads it as a Cauchy column
+        (the gather copies the columns before the pole step writes, so that level may reuse it), or after
+        its own level if it is never read."""
+        z = self.zero_slot
+        born, last = {}, {}
+        for lev in self.levels:
+            if lev is None:
+                continue
+            m = lev["m"]
+            for t in lev["t_slot"].tolist():
+                born[t] = m
+            for c in lev["col"].reshape(-1).tolist():
+                if c != z:
+                    last[c] = max(last.get(c, -1), m)
+        if not reuse:
+            self.phys, self.nphys = {t: t for t in born}, 2 * self.nslots
+        else:
+            self.phys, free, release, n = {}, [], {}, 0
+            for t in sorted(born, key=lambda t: (born[t], t)):
+                m = born[t]
+                for mm in [k for k in release if k <= m]:
+                    free += release.pop(mm)
+                ph = free.pop() if free else n
+                n += ph == n
+                self.phys[t] = ph
+                d = last.get(t, -1)
+                release.setdefault(d if d > m else m + 1, []).append(ph)
+            self.nphys = n
+        self.zero_slot = self.nphys
+        for lev in self.levels:
+            if lev is None:
+                continue
+            lev["t_slot"] = torch.tensor([self.phys[t] for t in lev["t_slot"].tolist()], dtype=torch.long)
+            lev["col"] = torch.tensor([self.phys.get(c, self.nphys) for c in lev["col"].reshape(-1).tolist()],
+                                      dtype=torch.long).reshape(lev["col"].shape)
+
+    def phys_slot(self, logical):
+        """physical slot of a logical one (the zero slot if it is never written)"""
+        return self.phys.get(logical, self.zero_slot)
+
     def counts(self):
         """output entries of the Cauchy and pole steps per right-hand side (rows padded per level,
         structures padded to Smax^2) -- what run() computes"""
@@ -203,11 +249,12 @@ class Recursion:
         self.levels = [None if lev is None else {k: (v.to(dev) if torch.is_tensor(v) else v)
                                                  for k, v in lev.items()} for lev in plan.levels]
 
-    def run(self, h_inf, timer=None, prof=None):
-        """h_inf: MPF (2, order, Jh, Smax^2, B).  Returns residues MPF (2 nslots + 1, Smax^2, B)."""
+    def run(self, h_inf, timer=None, prof=None, hook=None):
+        """h_inf: MPF (2, >= order, Jh, Smax^2, B).  Returns residues MPF (nphys + 1, Smax^2, B) (physical
+        slots).  hook(m, res) is called after each level (e.g. Derivs.accumulate)."""
         pl, L, Sm = self.plan, self.L, self.plan.Smax
         S2, B = Sm * Sm, h_inf.shape[-1]
-        res = mpf.zeros((2 * pl.nslots + 1, S2, B), L)
+        res = mpf.zeros((pl.nphys + 1, S2, B), L)
         if prof is not None:
             _tick(prof, None)
         for lev in self.levels:
@@ -238,6 +285,10 @@ class Recursion:
                 res.e[lev["t_slot"][sl]] = out.e
             if prof is not None:
                 _tick(prof, "pole")
+            if hook is not None:
+                hook(m, res)
+                if prof is not None:
+                    _tick(prof, "moments")
             if timer:
                 timer(m)
         return res
@@ -273,4 +324,5 @@ class Recursion:
         return out.reshape(T, S2, B)
 
     def slot(self, p, m, jidx, pidx):
-        return p * self.plan.nslots + self.plan.offset[(m, jidx)] + pidx
+        """physical slot of residue (p, m, jidx, pidx) (meaningful after run() only without reuse)"""
+        return self.plan.phys_slot(p * self.plan.nslots + self.plan.offset[(m, jidx)] + pidx)

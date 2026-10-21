@@ -44,7 +44,7 @@ def test(tj12=4, tj43=2, tjmax=6, order=7, L=10, B=3, seed=1, **opts):
         for (p, m, j, q, a, b), v in ref.items():
             blk[(p, m, j, q)] = max(blk.get((p, m, j, q), 0), abs(v))
         for (p, m, j, q, a, b), v in ref.items():
-            g = res[p * plan.nslots + plan.offset[(m, j)] + q, a * Sm + b, k]
+            g = res[plan.phys_slot(p * plan.nslots + plan.offset[(m, j)] + q), a * Sm + b, k]
             if blk[(p, m, j, q)]:
                 worst = max(worst, abs(g - v) / blk[(p, m, j, q)])
     bits = -float(mp.log(worst, 2)) if worst else float("inf")
