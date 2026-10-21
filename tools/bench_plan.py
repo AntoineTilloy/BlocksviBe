@@ -15,3 +15,13 @@ print(f"2j12={tj12} 2j43={tj43} j_max={jmax} order={order}: plan {t1 - t0:.1f} s
       f"{resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6:.2f} GB, index tensors {nbytes / 1e9:.2f} GB; "
       f"{tasks:.3g} tasks, {2 * plan.nslots:.3g} logical / {plan.nphys:.3g} physical slots, {len(plan.Mkeys)} M keys, "
       f"dense Cauchy tables would be {dense:.3g} entries ({dense * 12 / 1e9:.1f} GB as cdiff+cidx)")
+if len(sys.argv) > 6:                                   # also the derivative-stage constants: R L
+    from sdpvibe.blocks import derivatives as DV
+    R, L = int(sys.argv[5]), int(sys.argv[6])
+    t2 = time.time()
+    der = DV.Derivs(plan, R, L)
+    torch.cuda.synchronize()
+    t3 = time.time()
+    gb = sum(x.m.numel() * 4 + x.e.numel() * 8 for x in (der.Anum, der.Ttab)) / 1e9
+    print(f"Derivs (R={R}, L={L}): {t3 - t2:.1f} s; spins {der.Jo}, poles {der.NP}; constants on GPU {gb:.2f} GB "
+          f"(numerator matrix {der.Anum.shape})")

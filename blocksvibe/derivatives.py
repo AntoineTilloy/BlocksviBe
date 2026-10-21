@@ -27,7 +27,6 @@ above is the same quantity.)  Every map is linear with exact (dyadic rational) c
 Pole shifting (kept_pole_order < order) is not implemented: the stress-tensor runs use kept_pole_order =
 order.  All GEMMs are the RNS/INT8 tensor-core sdpvibe.mpf.gemm (normwise error, rounded once per entry).
 """
-from fractions import Fraction
 from math import comb
 import cupy as cp
 import mpmath as mp
@@ -106,10 +105,21 @@ def _cat(parts, dim):
     return mpf.MPF(torch.cat([p.m for p in parts], dim + 1), torch.cat([p.e for p in parts], dim))
 
 
-def _dyadic(vals, L, shape):
-    """exact rationals with power-of-two denominators (or ints) -> MPF, rounded to working precision"""
-    return mpf.from_mp([mp.mpf(v) if isinstance(v, int) else mp.mpf(v.numerator) / v.denominator
-                        for v in vals], L, shape)
+def exact_mpf(ints, exps, L, shape):
+    """exact values ints[i] * 2^exps[i] (Python ints of any size) -> MPF, rounded once to NB bits (half up
+    on the magnitude, like mpf.from_mp) -- without going through mpmath"""
+    NB = mpf.NBITS(L)
+    out_i, out_e = [], []
+    for v, e in zip(ints, exps):
+        if v:
+            a = -v if v < 0 else v
+            sh = a.bit_length() - NB
+            if sh > 0:
+                a = (a + (1 << (sh - 1))) >> sh
+                e += sh
+            v = -a if v < 0 else a
+        out_i.append(v); out_e.append(e)
+    return mpf.from_ints(out_i, out_e, L, shape)
 
 
 def _polymul_lin(p, a):
@@ -119,6 +129,19 @@ def _polymul_lin(p, a):
         out[k] += a * c
         out[k + 1] += c
     return out
+
+
+def _syndiv_all(p, roots):
+    """[p(y) / (y - r) for r in roots] (exact, integer coefficients), vectorised over the roots"""
+    n = len(p) - 1
+    r = np.array(roots, dtype=object)
+    acc = np.zeros(len(roots), dtype=object)
+    q = np.empty((n, len(roots)), dtype=object)
+    for k in range(n, 0, -1):
+        acc = p[k] + r * acc
+        q[k - 1] = acc
+    assert all(p[0] + r * acc == 0)
+    return [list(q[:, i]) for i in range(len(roots))]
 
 
 def _syndiv(p, root):
@@ -183,33 +206,35 @@ class Derivs:
         self.rcpow = mpf.from_mp([rc ** n for n in range(order + 1)], L, (order + 1,))
         self.Wh = mpf.from_mp([(mp.mpf(n) ** k if (n or k) else 1) * rc ** n
                                for k in range(R + 1) for n in range(order + 1)], L, (R + 1, order + 1))
-        # pole positions D_i (doubled, exact) per (spin, pole); table of C(e,d) D^(e-d) per distinct D
+        # pole positions D_i = d/2 per (spin, pole); table of C(e,k) D^(e-k) = C(e,k) d^(e-k) 2^-(e-k) per distinct d
         d2 = sorted({S.delta_2(P, tj) for tj, pl in zip(self.tjs, self.poles) for P in pl})
         di = {d: k + 1 for k, d in enumerate(d2)}                     # 0: padding (all zero)
-        tab = [0] * ((R + 1) * (R + 1))
+        ints, exps = [0] * ((R + 1) * (R + 1)), [0] * ((R + 1) * (R + 1))
         for d in d2:
-            D = Fraction(d, 2)
-            tab += [comb(e, k) * D ** (e - k) if k <= e else 0 for e in range(R + 1) for k in range(R + 1)]
-        self.Ttab = _dyadic(tab, L, (len(d2) + 1, R + 1, R + 1))
-        didx = torch.zeros((Jo, NP), dtype=torch.long)
+            pw = [d ** q for q in range(R + 1)]
+            for e in range(R + 1):
+                ints += [comb(e, k) * pw[e - k] if k <= e else 0 for k in range(R + 1)]
+                exps += [k - e for k in range(R + 1)]
+        self.Ttab = exact_mpf(ints, exps, L, (len(d2) + 1, R + 1, R + 1))
+        didx = np.zeros((Jo, NP), dtype=np.int64)
         for jo, (tj, pl) in enumerate(zip(self.tjs, self.poles)):
-            for i, P in enumerate(pl):
-                didx[jo, i] = di[S.delta_2(P, tj)]
-        self.didx = didx.to(dev)                                      # T, Vand gathered per spin chunk
+            didx[jo, :len(pl)] = [di[S.delta_2(P, tj)] for P in pl]
+        self.didx = torch.from_numpy(didx).to(dev)                    # T, Vand gathered per spin chunk
+        # polynomial part (finish_iter): H[e][s] = sum_d C(e,d) G[s-1-d][d], P_e[t] = C(e,t) c[e-t] + H[e][e-t]
+        self.Cb = exact_mpf([comb(e, d) for e in range(R + 1) for d in range(R + 1)], [0] * (R + 1) ** 2, L,
+                            (R + 1, R + 1))
         Rw = max(R, 1)
-        # P_e[t] = C(e,t) c[e-t] + sum_{u=t+1}^{e} C(e,u) G[e-u][u-t-1];  inputs: c[d] (R+1), G[d][w] (Rw x (R+1), w major)
-        Kin = (R + 1) + Rw * (R + 1)
-        A = np.zeros(((R + 1) * (R + 1), Kin), dtype=object)
-        for e in range(R + 1):
-            for t in range(e + 1):
-                A[e * (R + 1) + t, e - t] += comb(e, t)
-                for u in range(t + 1, e + 1):
-                    A[e * (R + 1) + t, (R + 1) + (u - t - 1) * (R + 1) + (e - u)] += comb(e, u)
-        self.Apoly = _dyadic([int(x) for x in A.reshape(-1)], L, A.shape)
+        sd = [(sv, d) for sv in range(R + 1) for d in range(R + 1)]
+        self.gidx = torch.tensor([(sv - 1 - d) * (R + 1) + d if 1 <= sv and d <= sv - 1 else Rw * (R + 1)
+                                  for sv, d in sd], device=dev)       # G[w][d] -> G'[s][d] (last: zero)
+        te = [(t, e) for t in range(R + 1) for e in range(R + 1)]
+        self.cidx_te = torch.tensor([e - t if t <= e else R + 1 for t, e in te], device=dev)     # c[e-t] (R+1: zero)
+        self.hidx_te = torch.tensor([e * (R + 1) + (e - t) if t <= e else (R + 1) ** 2 for t, e in te], device=dev)
+        self.cb_te = exact_mpf([comb(e, t) if t <= e else 0 for t, e in te], [0] * len(te), L, (len(te),))
         # numerator matrix per spin: columns Pi(x) (x + ub)^t (t <= R), then Pi_i(x); in y = 2x the roots
         # y_i = 2 x_i are integers (<= 0), so everything is exact integer arithmetic, scaled at the end
-        Dout = self.Dout
-        vals = [0] * (Jo * Dout * (R + 1 + NP))
+        Dout, W = self.Dout, R + 1 + NP
+        ints, exps = [0] * (Jo * Dout * W), [0] * (Jo * Dout * W)
         for jo, (tj, pl) in enumerate(zip(self.tjs, self.poles)):
             two_ub = tj + 1 if tj <= 1 else tj + 2
             roots = [S.delta_2(P, tj) - two_ub for P in pl]
@@ -220,15 +245,14 @@ class Derivs:
             cols = []
             q = Pi
             for t in range(R + 1):                                    # 2^-(npj+t) Pi_y(y) (y + 2ub)^t
-                cols.append((q, npj + t))
+                cols.append((t, q, npj + t))
                 q = _polymul_lin(q, two_ub)
-            cols += [(_syndiv(Pi, y0), npj - 1) for y0 in roots]
-            for c, (poly, sc) in enumerate(cols):
-                cc = c if c <= R else R + 1 + (c - R - 1)
-                for k, v in enumerate(poly):                          # x^k coefficient: v 2^(k - sc)
-                    if v:
-                        vals[(jo * Dout + k) * (R + 1 + NP) + cc] = Fraction(v) * Fraction(2) ** (k - sc)
-        self.Anum = _dyadic(vals, L, (Jo, Dout, R + 1 + NP))
+            cols += [(R + 1 + i, qi, npj - 1) for i, qi in enumerate(_syndiv_all(Pi, roots))]
+            for cc, poly, sc in cols:                                 # x^k coefficient: v 2^(k - sc)
+                base = jo * Dout * W + cc
+                ints[base:base + len(poly) * W:W] = poly
+                exps[base:base + len(poly) * W:W] = range(-sc, len(poly) - sc)
+        self.Anum = exact_mpf(ints, exps, L, (Jo, Dout, W))
 
     def start(self, B):
         """zero moment accumulators for a batch of B right-hand sides"""
@@ -296,13 +320,22 @@ class Derivs:
             G = bgemm(Vand, v.reshape(J, NP, (R + 1) * Nc)).reshape(J, Rw * (R + 1), Nc)  # G[w][d]
             del v
             tick("G")
-            X = _permute(_cat([c[j0:j1], G], 1), (1, 0, 2)).reshape(-1, J * Nc)
+            Gz = _cat([G.reshape(J, Rw * (R + 1), Nc), mpf.zeros((J, 1, Nc), self.L)], 1)
             del G
-            P = mpf.gemm(self.Apoly, X).reshape(R + 1, R + 1, J, Nc)                    # (e, t, jo, col)
-            P = _permute(P, (2, 1, 0, 3)).reshape(J, R + 1, (R + 1) * Nc)               # (jo, t, e col)
+            Gs = _permute(_take(_permute(Gz, (1, 0, 2)), self.gidx).reshape(R + 1, R + 1, J, Nc), (1, 2, 0, 3))
+            del Gz                                                                       # G'[s][d] as (d, jo, s, col)
+            Hm = mpf.gemm(self.Cb, Gs.reshape(R + 1, -1)).reshape(R + 1, J, R + 1, Nc)  # H[e][s] (e, jo, s, col)
+            del Gs
+            Hm = _cat([_permute(Hm, (0, 2, 1, 3)).reshape((R + 1) ** 2, J, Nc), mpf.zeros((1, J, Nc), self.L)], 0)
+            cz = _cat([_permute(c[j0:j1], (1, 0, 2)), mpf.zeros((1, J, Nc), self.L)], 0)  # (d | zero, jo, col)
+            T2 = (R + 1) ** 2
+            P = mpf.mul(_take(cz, self.cidx_te), _expand(self.cb_te[:, None, None], (T2, J, Nc)))
+            P = mpf.add(P, _take(Hm, self.hidx_te))                                      # ((t, e), jo, col)
+            del Hm, cz
+            P = _permute(P.reshape(R + 1, R + 1, J, Nc), (2, 0, 1, 3)).reshape(J, R + 1, (R + 1) * Nc)  # (jo, t, e col)
             tick("polynomial part")
             Bn = _cat([P, a.reshape(J, NP, (R + 1) * Nc)], 1)                            # (jo, t | i, e col)
-            del P, a, X
+            del P, a
             tick("layout")
             num = bgemm(self.Anum[j0:j1], Bn)                                            # (J, Dout, (R+1) Nc)
             tick("numerators")
