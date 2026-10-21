@@ -190,6 +190,28 @@ class Output:
         return _permute(out, (1, 2, 3, 4, 0, 5))
 
 
+def apply_per_order(out, nums):
+    """Output.apply for numerators given per lambda order (each from its own Derivs with R = Lambda - n):
+    nums[idx]: MPF (Jo, Dout_n, R_n+1, 2, S2, nq), idx over the task's lambda orders (all of them for xt,
+    the first for xt_radial).  Returns MPF (Jo, 2, S2, nq, outputs, max Dout)."""
+    Dmax = max(x.shape[1] for x in nums)
+    rows = []
+    for idx, x in enumerate(nums):
+        e_needed = [e for i, e in out.inputs if i == idx]
+        if not e_needed:
+            continue
+        Jo, D, R1, _, S2, nq = x.shape
+        X = _permute(x, (2, 0, 3, 4, 5, 1))                                   # (e, jo, p, s, q, d)
+        if D < Dmax:
+            X = mpf.MPF(torch.cat([X.m, torch.zeros((X.L, R1, Jo, 2, S2, nq, Dmax - D), dtype=X.m.dtype, device=dev)], -1),
+                        torch.cat([X.e, torch.full((R1, Jo, 2, S2, nq, Dmax - D), mpf.EZ, dtype=X.e.dtype, device=dev)], -1))
+        rows.append(_take(X.reshape(R1, -1), torch.tensor(e_needed, device=dev)))
+    X = mpf.MPF(torch.cat([r.m for r in rows], 1), torch.cat([r.e for r in rows], 0))
+    Jo, _, _, _, S2, nq = nums[0].shape
+    res = mpf.gemm(out.W, X).reshape(len(out.outputs), Jo, 2, S2, nq, Dmax)
+    return _permute(res, (1, 2, 3, 4, 0, 5))
+
+
 def _fmt(x, digits):
     if x == 0:
         return "0"

@@ -21,7 +21,7 @@ above is the same quantity.)  Every map is linear with exact (dyadic rational) c
      kernel, one-limb multiplications by n): no residue has to be kept for this stage;
   2. c: one GEMM (R+1) x (order+1);  a: batched (R+1) x (R+1) GEMMs over (spin, pole);
      G: batched GEMM over spins with K = poles; P: one GEMM with a fixed binomial matrix;
-  3. numerators: batched GEMM over spins, A_j = [Pi_j(x) (x+ub_j)^t (t <= R) | Pi_{j,i}(x)], i.e. the
+  3. numerators: batched GEMM over spins, A_j = [Pi_{j,i}(x) | Pi_j(x) (x+ub_j)^t (t <= R)], i.e. the
      Delta -> x shift and together_with_factors in one product, K = R + 1 + poles.
 
 Pole shifting (kept_pole_order < order) is not implemented: the stress-tensor runs use kept_pole_order =
@@ -220,18 +220,8 @@ class Derivs:
         for jo, (tj, pl) in enumerate(zip(self.tjs, self.poles)):
             didx[jo, :len(pl)] = [di[S.delta_2(P, tj)] for P in pl]
         self.didx = torch.from_numpy(didx).to(dev)                    # T, Vand gathered per spin chunk
-        # polynomial part (finish_iter): H[e][s] = sum_d C(e,d) G[s-1-d][d], P_e[t] = C(e,t) c[e-t] + H[e][e-t]
-        self.Cb = exact_mpf([comb(e, d) for e in range(R + 1) for d in range(R + 1)], [0] * (R + 1) ** 2, L,
-                            (R + 1, R + 1))
-        Rw = max(R, 1)
-        sd = [(sv, d) for sv in range(R + 1) for d in range(R + 1)]
-        self.gidx = torch.tensor([(sv - 1 - d) * (R + 1) + d if 1 <= sv and d <= sv - 1 else Rw * (R + 1)
-                                  for sv, d in sd], device=dev)       # G[w][d] -> G'[s][d] (last: zero)
-        te = [(t, e) for t in range(R + 1) for e in range(R + 1)]
-        self.cidx_te = torch.tensor([e - t if t <= e else R + 1 for t, e in te], device=dev)     # c[e-t] (R+1: zero)
-        self.hidx_te = torch.tensor([e * (R + 1) + (e - t) if t <= e else (R + 1) ** 2 for t, e in te], device=dev)
-        self.cb_te = exact_mpf([comb(e, t) if t <= e else 0 for t, e in te], [0] * len(te), L, (len(te),))
-        # numerator matrix per spin: columns Pi(x) (x + ub)^t (t <= R), then Pi_i(x); in y = 2x the roots
+        self._small_constants()
+        # numerator matrix per spin: columns Pi_i(x), then Pi(x) (x + ub)^t (t <= R); in y = 2x the roots
         # y_i = 2 x_i are integers (<= 0), so everything is exact integer arithmetic, scaled at the end
         Dout, W = self.Dout, R + 1 + NP
         ints, exps = [0] * (Jo * Dout * W), [0] * (Jo * Dout * W)
@@ -245,14 +235,43 @@ class Derivs:
             cols = []
             q = Pi
             for t in range(R + 1):                                    # 2^-(npj+t) Pi_y(y) (y + 2ub)^t
-                cols.append((t, q, npj + t))
+                cols.append((NP + t, q, npj + t))
                 q = _polymul_lin(q, two_ub)
-            cols += [(R + 1 + i, qi, npj - 1) for i, qi in enumerate(_syndiv_all(Pi, roots))]
+            cols += [(i, qi, npj - 1) for i, qi in enumerate(_syndiv_all(Pi, roots))]
             for cc, poly, sc in cols:                                 # x^k coefficient: v 2^(k - sc)
                 base = jo * Dout * W + cc
                 ints[base:base + len(poly) * W:W] = poly
                 exps[base:base + len(poly) * W:W] = range(-sc, len(poly) - sc)
         self.Anum = exact_mpf(ints, exps, L, (Jo, Dout, W))
+
+    def _small_constants(self):
+        """R-dependent index tables of the polynomial part (finish_iter): H[e][s] = sum_d C(e,d) G[s-1-d][d],
+        P_e[t] = C(e,t) c[e-t] + H[e][e-t]"""
+        L, R = self.L, self.R
+        self.Cb = exact_mpf([comb(e, d) for e in range(R + 1) for d in range(R + 1)], [0] * (R + 1) ** 2, L,
+                            (R + 1, R + 1))
+        Rw = max(R, 1)
+        sd = [(sv, d) for sv in range(R + 1) for d in range(R + 1)]
+        self.gidx = torch.tensor([(sv - 1 - d) * (R + 1) + d if 1 <= sv and d <= sv - 1 else Rw * (R + 1)
+                                  for sv, d in sd], device=dev)       # G[w][d] -> G'[s][d] (last: zero)
+        te = [(t, e) for t in range(R + 1) for e in range(R + 1)]
+        self.cidx_te = torch.tensor([e - t if t <= e else R + 1 for t, e in te], device=dev)     # c[e-t] (R+1: zero)
+        self.hidx_te = torch.tensor([e * (R + 1) + (e - t) if t <= e else (R + 1) ** 2 for t, e in te], device=dev)
+        self.cb_te = exact_mpf([comb(e, t) if t <= e else 0 for t, e in te], [0] * len(te), L, (len(te),))
+
+    def for_order(self, R):
+        """the same stages for a smaller R (a higher lambda order of the task): constants are views of this
+        object's (Pi(x)(x+ub)^t for t <= R, C(e,k) D^(e-k) for e <= R, ...), so no extra GPU memory"""
+        assert R <= self.R
+        d = object.__new__(Derivs)
+        d.__dict__.update(self.__dict__)
+        d.R, d.Dout = R, self.NP + R + 1
+        R1, K = R + 1, self.NP + R + 1                                # columns: Pi_i, then t <= R
+        d.Anum = mpf.MPF(self.Anum.m[:, :, :d.Dout, :K], self.Anum.e[:, :d.Dout, :K])
+        d.Ttab = mpf.MPF(self.Ttab.m[:, :, :R1, :R1].contiguous(), self.Ttab.e[:, :R1, :R1].contiguous())
+        d.Wh = mpf.MPF(self.Wh.m[:, :R1].contiguous(), self.Wh.e[:R1].contiguous())
+        d._small_constants()
+        return d
 
     def start(self, B):
         """zero moment accumulators for a batch of B right-hand sides"""
@@ -334,7 +353,7 @@ class Derivs:
             del Hm, cz
             P = _permute(P.reshape(R + 1, R + 1, J, Nc), (2, 0, 1, 3)).reshape(J, R + 1, (R + 1) * Nc)  # (jo, t, e col)
             tick("polynomial part")
-            Bn = _cat([P, a.reshape(J, NP, (R + 1) * Nc)], 1)                            # (jo, t | i, e col)
+            Bn = _cat([a.reshape(J, NP, (R + 1) * Nc), P], 1)                            # (jo, i | t, e col)
             del P, a
             tick("layout")
             num = bgemm(self.Anum[j0:j1], Bn)                                            # (J, Dout, (R+1) Nc)

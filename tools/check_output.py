@@ -4,7 +4,8 @@ from an instrumented blocks_3d run, tools/blocks/b3d_dump.patch) -> derivatives/
 derivative with the files blocks_3d wrote (same task, same output template).
    python tools/blocks/check_output.py <blocks_3d out template, e.g. dir/out_{}.json> <dump prefix>
           two_j12 two_j43 two_j_max order Lambda four_pt_sign delta_1_plus_2 coords(xt,xt_radial) L bits
-   (TTTT, q4 and Delta_12 = Delta_43 = 0 are read back from blocks_3d's JSON header)"""
+   (TTTT, q4 and Delta_12 = Delta_43 = 0 are read back from blocks_3d's JSON header)
+   env PER_ORDER=1: one lambda order per recursion run (Derivs.for_order, output.apply_per_order)"""
 import glob, json, os, sys, time
 from collections import defaultdict
 import mpmath as mp
@@ -35,10 +36,20 @@ for k, d in enumerate(dumps):
         strs[((((s * (order + 1) + m) * J + j) * Sm + a) * Sm + b) * B + k] = v
 h = mpf.from_strings(strs, L, (2, order + 1, J, Sm * Sm, B))
 torch.cuda.synchronize(); t2 = time.time()
-der.start(B)
-rec.run(h, hook=der.accumulate)
-num = der.finish(h)
-res = [o.apply(num, nL=B) for o in outs]
+if os.environ.get("PER_ORDER") == "1":                  # one lambda order at a time (Derivs.for_order), as bench_chain
+    nums = []
+    for k, n in enumerate(ns):
+        dn = der.for_order(Lam - n)
+        hk = mpf.MPF(h.m[..., k:k + 1].contiguous(), h.e[..., k:k + 1].contiguous())
+        dn.start(1)
+        rec.run(hk, hook=dn.accumulate)
+        nums.append(dn.finish(hk, chunk=3))
+    res = [OUT.apply_per_order(o, nums) for o in outs]
+else:
+    der.start(B)
+    rec.run(h, hook=der.accumulate)
+    num = der.finish(h)
+    res = [o.apply(num, nL=B) for o in outs]
 torch.cuda.synchronize(); t3 = time.time()
 print(f"constants {t1 - t0:.1f} s (write_output maps {[tuple(o.W.shape) for o in outs]}), GPU chain {t3 - t2:.2f} s "
       f"for {B} lambda order(s)")
