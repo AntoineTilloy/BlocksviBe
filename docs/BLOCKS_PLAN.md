@@ -61,6 +61,13 @@ vast.ai: Threadripper 3960X + RTX 3090, 2026-10-20); everything else is labelled
    order 30, ~1.6x per doubling): projected ~300-600 cores at nmax=22-26 with these kernels (blocks_3d itself measured at
    ~1,700 core-s per right-hand side at order 130), ~1000+ with the next kernel work (section 6).  Memory, not arithmetic, is the production constraint: 9-19 GB of live state per
    right-hand side at nmax=22-26 (section 5).
+   **Post-recursion stages ported too (2026-10-21)**: derivative moments accumulated during the recursion,
+   r^Delta restoration, Delta -> x shift and `together_with_factors` as batched RNS GEMMs, producing
+   blocks_3d's `Log_r_Derivatives` numerators; **validated against blocks_3d to its working precision**
+   (2^-261 at 256 bits, 2^-506 at 512 bits, relative to the largest coefficient, TTTT j12=j43=2, orders
+   16-20).  **4.3 s per right-hand side on the laptop A3000 at the nmax=10 shape vs 211 core-s for the
+   same blocks_3d stages** (A3000 ~ 50 cores, ~40-55 at order 30; a 3090 should be ~3x faster,
+   estimate), with residue slots recycled after their last use (42% of the slots at order 60).
 
 5. **Haskell side** (section 7): ttoBlock/tsMixedBlock are JSON-parse bound (~50 us per 240-byte
    number, files re-read 3x), partChunk is dominated by an O(D^2) Horner polynomial shift x -> x+1e-6 per
@@ -158,6 +165,9 @@ group: computing it once per group is a free CPU-side saving.
 h_inf and residues when `B3D_DUMP=<prefix>`).  Checks: `tools/blocks/check_ref.py`, `check_gpu.py` (vs
 dumps), `tests/test_blocks_recursion.py` (GPU vs exact port, all kernel variants).  Benchmarks:
 `tools/blocks/bench_recursion.py`, `bench_cauchy.py`, `bench_shapes.py`, `opcount.py`, `live_memory.py`.
+Post-recursion stages: `derivatives.py`; checks `tools/blocks/check_derivs.py` (vs the numerators dumped
+by the patched blocks_3d), `tests/test_blocks_derivatives.py` (vs an mpmath port of blocks_3d's code);
+benchmark `tools/blocks/bench_derivs.py`.
 
 * Plan (CPU, once per operator): slot layout of all residues (slot = parity, level, spin, pole), per level
   the (src, j') groups with their Cauchy rows D' and columns (prime poles), and per task the indices of
@@ -176,6 +186,36 @@ dumps), `tests/test_blocks_recursion.py` (GPU vs exact port, all kernel variants
   2^-262 relative to the largest residue (all kernel variants); the exact port agrees with blocks_3d entry
   by entry except entries that are cancellation noise (~1e-97) in both.  Random operators (S up to 5,
   three right-hand sides): GPU = exact port to 2^-310 at 318-bit mantissas.
+* Slot recycling (`Plan(reuse=True)`): a residue is read once as a Cauchy column, at level m + shift, so
+  its physical slot is recycled after that level (or after its own level if it is never read; the
+  derivative moments are taken right after the level that produces it).  Physical slots: 4,062 of
+  10,134 at order 16, 294,860 of 699,214 (42%) at order 60, j_max 60, 2j12 = 2j43 = 8.
+
+### Post-recursion stages (`derivatives.py`)
+
+blocks_3d per (spin j, parity, structure), w[k][n] = n^k r_c^n, R = Lambda - n_lambda, poles i of spin j
+at full order (positions D_i, shifts s_i), x = Delta - ub_j:
+
+* `residues_to_derivatives`: c[k] = sum_m w[k][m] h_inf[m], v_i[k] = sum_m w[k][m + s_i] res[m][i].
+  On the GPU the moments v are **accumulated level by level** during the recursion (hook after each
+  level): y = res r_c^n (one product), then v[k] += n^k y for k <= R by one-limb multiplications in a
+  CUDA-core kernel.  No residue has to survive its last Cauchy use.  c is one GEMM.
+* `restore_r_delta`: g_e = sum_{d<=e} C(e,d) Delta^(e-d) (c[d] + sum_i v_i[d]/(Delta - D_i)) =
+  P_e(Delta) + sum_i a_i[e]/(Delta - D_i), with a_i[e] = sum_d C(e,d) D_i^(e-d) v_i[d] (batched
+  (R+1)^2 GEMMs over (spin, pole): O(R^2) per pole instead of blocks_3d's O(R^3) polynomial divisions)
+  and P_e[t] = C(e,t) c[e-t] + sum_{u>t} C(e,u) G[e-u][u-t-1], G[d][w] = sum_i D_i^w v_i[d] (one
+  batched GEMM with K = poles, then one fixed binomial matrix).
+* `shift_fraction` + `together_with_factors`: numerator_e(x) = P_e(x + ub) Pi(x) + sum_i a_i[e] Pi_i(x)
+  is **one batched GEMM per spin chunk** with A_j = [Pi(x)(x + ub)^t, t <= R | Pi_i(x)] (K = R + 1 +
+  poles), built exactly in integers (in y = 2x the roots are integers <= 0: products and exact synthetic
+  division) and rounded once.  Pole shifting (kept_pole_order < order) is not ported: the stress-tensor
+  programs use kept_pole_order = order.
+* Validation (`check_derivs.py`, recycled slots, h_inf from the dump): TTTT j12 = j43 = 2, q4 =
+  (1,2,1,0), order 16, Lambda 7, j 0..10, blocks_3d at 256 bits, GPU 318 bits, n = 0, 2, 4, 6 as one
+  batch: all 2,460 numerator polynomials agree to **2^-261.3 relative to their largest coefficient**
+  (2^-253 per coefficient above 2^-64 of the largest); q4 = (2,1,0,1), order 20, Lambda 11, j 0..12,
+  512 bits (GPU 574), n = 0, 4, 10: 3,278 polynomials to **2^-506.5** (2^-500 per coefficient), i.e.
+  blocks_3d's own precision.  Random operators vs the mpmath port: 2^-299 at 318 bits.
 
 Kernel rates (RTX A3000 laptop, 926-bit mantissas, per output entry):
 
@@ -200,7 +240,8 @@ Per right-hand side (one q4, one n), 896 bits, 2j12 = 2j43 = 8, from `live_memor
 | order 152, j_max 100 (nmax=26) | 23.5 GB | 10.0 GB | 8.9 GB |
 
 A residue is needed only until the level that consumes it as a Cauchy column (m + shift); internal-spin
-residues can be reduced on the fly to the Lambda-n+1 moments sum_m m^k r_c^m res[m] that
+residues can be reduced on the fly (both implemented since 2026-10-21, section 4; measured at order 60:
+294,860 physical slots, 0.9 GB at 926 bits, and 1.17 GB of moments for R = 19, per right-hand side) to the Lambda-n+1 moments sum_m m^k r_c^m res[m] that
 `residues_to_derivatives` needs.  Even so, a 24 GB card holds one or two right-hand sides at nmax=22-26:
 production needs (a) kernels that are efficient at small batch -- the CUDA-core kernels are (no
 per-call conversion of the constant Cauchy matrix, no CRT), the RNS GEMM is not (at N = 25 B = 50-100
@@ -235,6 +276,36 @@ MAC-count model above predicts (at this size blocks_3d's tasks become memory-lat
 gathers ~300 residues scattered over ~10 GB).  The GPU cost for that shape is ~1e8 entries per
 right-hand side, i.e. ~3-6 s at the measured 25-50 ns per entry: ~300-600 cores (estimate).
 
+**Post-recursion stages** (`derivatives.py`, measured 2026-10-21 on the laptop).  Per right-hand side
+(n = 0, R = Lambda), 2j12 = 2j43 = 8, TTTT q4 = (1,2,1,0) xt_radial task, blocks_3d native + jemalloc at
+896 bits (its `residues_to_derivatives` + `shift` timers; `write_output` not included); GPU at 926 bits on
+a synthetic operator of the same shape (`bench_derivs.py`), RTX A3000 laptop with ~2.2 GB usable next to
+the desktop:
+
+| | blocks_3d, 1 thread: derivs + shift | blocks_3d, 8 threads (wall) | A3000 | A3000 = CPU cores |
+|---|---|---|---|---|
+| order 30, j_max 30, Lambda 11 | 6.4 + 11.0 = **17.4 core-s** | 0.9 + 1.6 s | **0.43 s** (B=1), 0.32 s (B=4) | 40 / 54 |
+| order 60, j_max 60, Lambda 19 (nmax=10 shape) | 76.2 + 134.9 = **211 core-s** | 12.2 + 21.6 s | **4.3 s** (B=1) | **~50** |
+
+For reference, blocks_3d's recursion in the same runs: 9.6 and 129 core-s; its init (single-threaded,
+per task) 4.6 and 31 s, including 7.3 s of pole products at order 60 that are computed even without
+pole shifting (the GPU constants -- exact integer products in Python -- take 1.6 / 10.5 s once per
+operator and R).  GPU breakdown, order 30, B=1 (B=4): moments during the recursion 0.12 (0.11),
+residues a_i 0.09 (0.09), G 0.03, polynomial part 0.01-0.02, numerator GEMM 0.17 (0.08) s.  Order 60,
+B=1: moments 1.45 s, the rest 2.84 s including streaming the 1.17 GB of moments back from host memory
+(OFFLOAD=1: mpf.gemm's ~1 GB working set does not fit next to them on this card; not needed on a
+24 GB card, where B can also grow).  The chunk of spins per final GEMM (1-8) does not matter.
+
+What limits it now (fixes not attempted): (i) the moments kernel reads and writes all R+1 accumulators
+of an entry at every level (memory-bound; accumulating W levels' residues and adding them with a K = W
+GEMM, or keeping the accumulators of a pole in registers across levels, would cut the traffic ~W-fold);
+(ii) the a_i step is (R+1) x (R+1) RNS GEMMs batched over (spin, pole) -- K <= 20, CRT-bound: the CUDA-
+core small-GEMM kernel fits it better; (iii) B = 1: the numerator GEMM halves from B=1 to B=4.  On a
+3090 (3.5x the memory bandwidth, ~4x the A3000's RNS GEMM rate measured on the pole step) the order-60
+figure should be ~1.2-1.5 s per right-hand side (~150-180 cores, estimate), i.e. about the recursion's
+0.99 s; with (i)-(iii) ~0.5 s.  So the post-recursion stages no longer dominate on the GPU as they
+do in blocks_3d (where they are 1.6x the recursion at order 60), but they are not negligible either.
+
 Projection to production orders.  From order 30 to 60 the CPU cost per right-hand side grows ~12x
 (it follows the multiprecision MAC count, opcount.py), the GPU cost ~7x (it follows the number of
 output entries): the ratio improves ~1.6x per doubling of the order (x1.9 from order 60 to 152).  At order 130-152:
@@ -243,8 +314,9 @@ argument, ~300-600 by the order-130 check above, ~1000+ with a warp-cooperative/
 and residue tables for the RNS Cauchy step** (estimates, +-2x).  The later
 stages (derivatives at r_c: K = order; r^Delta restoration and `together`: K = number of poles ~ 300-380;
 coordinate transforms) are large-K linear maps where the RNS GEMMs are efficient (measured 4.5 G MAC/s
-on the A3000 at K = 384, ~3x that on a 3090), against GMP loops with temporaries on the CPU; they must
-be ported too (Amdahl), and the output should go to composites/PMP pieces directly instead of ~TB of JSON.
+on the A3000 at K = 384, ~3x that on a 3090), against GMP loops with temporaries on the CPU; all but
+the coordinate transforms are now ported (above), and the output should go to composites/PMP pieces
+directly instead of ~TB of JSON.
 
 What this means per point (blocks part only; Haskell section 7; GPU numbers assume all blocks_3d stages
 ported at the recursion's ratio):
@@ -322,11 +394,16 @@ In order of value per effort.  Effort figures are rough.
 4. **GPU block engine** (2-4 weeks, in `sdpvibe/blocks/`), driven by the plan/kernels prototyped here:
    * production plan builder (vectorised or C++; the Python plan takes minutes at order 60) and
      constants from blocks_3d's own init (via the dump patch, or a small C++ library entry point);
-   * memory: free Cauchy columns after use and accumulate derivative moments on the fly (section 5);
-     B = 1-2 right-hand sides per 24 GB card at nmax=22-26, or host-RAM streaming for larger B;
+   * memory: free Cauchy columns after use and accumulate derivative moments on the fly (section 5)
+     -- **done 2026-10-21** (`Plan(reuse=True)`, `Derivs.accumulate`); B = 1-2 right-hand sides per
+     24 GB card at nmax=22-26, or host-RAM streaming for larger B (the moments can already be moved to
+     the host before the final GEMMs, `Derivs.offload`);
    * kernels: warp-cooperative, fused pole step (gather + q L H R^T + normalise; today 222 registers per
-     thread at 926 bits), residue tables for the RNS Cauchy step at small B; then the post-recursion
-     stages (half or more of blocks_3d's time from nmax=14 on) as RNS GEMMs;
+     thread at 926 bits), residue tables for the RNS Cauchy step at small B; the post-recursion
+     stages up to the `Log_r_Derivatives` numerators are **done 2026-10-21** (`derivatives.py`,
+     validated against blocks_3d; next: the moments kernel and small-K steps of section 6, pole shifting
+     if kept_pole_order < order is ever needed, and write_output's coordinate transforms, which are
+     fixed linear maps on the numerators too);
    * output straight into composite blocks / PMP pieces (no JSON), validated against blocks_3d JSON for
      a few tasks and against SDPB results at nmax=6-10;
    * expected: per point ~2-5 h of one 3090 at nmax=22 (vs 1.5k core-h), TTTT at nmax=26 ~1-2.5 days
@@ -343,5 +420,8 @@ port) and speed (A3000, RTX 3090), memory per right-hand side (exact counts).  N
 blocks_3d stage split at order 130-152 with all spins (only the cases in section 2), the
 post-recursion stages on the GPU, the GPU recursion at order 130-152 (the Python plan builder is too
 slow there), an end-to-end GPU-generated PMP.  RTX 3090 rental for these tests: 1.8 h, $0.51 total.
+Added 2026-10-21 (laptop only, no rental): GPU post-recursion stages validated against blocks_3d's
+numerators (orders 16-20) and timed at orders 30 and 60 against single-threaded blocks_3d (jemalloc);
+not measured: these stages on a 3090, at B > 1 at order 60, or at production orders.
 Raw logs of the rental are not in the repository (results/ is ignored); the numbers above are copied
 from them.
