@@ -4,4 +4,7 @@
 # PYTHONPATH).  Unsupported options fall back to $BLOCKSVIBE_FALLBACK (official binary, + $BLOCKSVIBE_JEMALLOC).
 HERE=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
 export PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}"
+# one BLAS/OpenMP thread per process: pipelines start dozens of blocks_3d processes at once (most of them
+# wait in the spool), and OpenBLAS's per-process pool of nproc threads exhausted a container's thread limit
+export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1} OMP_NUM_THREADS=${OMP_NUM_THREADS:-1} MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
 exec "${BLOCKSVIBE_PYTHON:-python3}" -m blocksvibe "$@"

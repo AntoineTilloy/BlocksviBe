@@ -30,7 +30,9 @@ selfkill() {
 log "start: $NP cores ($(nproc) threads), $(free -g | awk '/Mem:/{print $2}') GB RAM, $(df -h ~ | awk 'NR==2{print $4}') free disk, $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader)"
 
 # ---------------------------------------------------------------- 1. setup
+# resume: SKIP_SETUP=1 (all of section 1 done), SKIP_A=1 with OBJ_A, NSV_A (run A done)
 t0=$(date +%s)
+if [ "${SKIP_SETUP:-0}" != 1 ]; then
 cd ~/SDPviBe
 bash vast/remote_setup.sh > ~/BlocksviBe/results/setup_python.log 2>&1 || log "FAILED python setup: $(tail -2 ~/BlocksviBe/results/setup_python.log)"
 bash vast/remote_sdpb_setup.sh > ~/BlocksviBe/results/setup_sdpb.log 2>&1 || log "FAILED sdpb setup: $(tail -2 ~/BlocksviBe/results/setup_sdpb.log)"
@@ -48,7 +50,11 @@ apt-get install -y -qq libboost-dev libgmp-dev libeigen3-dev > results/apt_b3d.l
 [ -d ext/blocks_3d ] || git clone -q https://gitlab.com/bootstrapcollaboration/blocks_3d ext/blocks_3d
 log "blocks_3d sources at $(git -C ext/blocks_3d log --oneline -1)"
 make -C csrc -j$(nproc) B3D=$PWD/ext/blocks_3d ENV=/usr > results/build_b3d_setup.log 2>&1 || log "FAILED b3d_setup: $(grep -m3 error results/build_b3d_setup.log | tr '\n' ' ')"
+fi
+EXE=$(find ~/SDPviBe/ext/stress-tensors-3d/.stack-work -type f -name stress-tensors-3d-exec -perm -u+x | head -1)
+cd ~/BlocksviBe
 . ~/venv/bin/activate
+python3 -c "import gmpy2" 2> /dev/null || python3 -m pip install -q gmpy2 > /dev/null 2>&1
 PY=$(command -v python3)
 log "setup done in $(( ($(date +%s) - t0) / 60 )) min (exe $EXE, python $PY)"
 
@@ -60,34 +66,36 @@ R=~/SDPviBe/tools/sdpb_root
 export OPAL_PREFIX=$R/usr OMPI_ALLOW_RUN_AS_ROOT=1 OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
 MPI="$R/usr/bin/mpirun --allow-run-as-root"
 cp $C/blocks_3d.sh results/blocks_3d_official.sh
+# hyperion's pmp2sdp call: OpenMPI aborts under the fake Slurm environment (SLURM_TASKS_PER_NODE missing);
+# not needed here (the PMP is converted below) but kept working
+for s in pmp2sdp srun_pmp2sdp; do grep -q '^for v in' $C/$s.sh || sed -i '2i for v in $(env | grep -o "^SLURM[A-Z_]*"); do unset $v; done' $C/$s.sh; done
 
 stop_hyperion() {
-    for p in $(pgrep -x stress-tensors-); do kill $p 2>/dev/null; done
+    for p in $(pgrep -f stress-tensors-3d-exec); do kill $p 2>/dev/null; done
     pkill -f '^sleep infinity$' 2>/dev/null
-    for p in $(pgrep -x blocks_3d) $(pgrep -f 'blocksvibe') $(pgrep -x pmp2sdp); do kill $p 2>/dev/null; done
+    for p in $(pgrep -f 'b3d_root/usr/local/bin/blocks_3d') $(pgrep -f 'python3 -m blocksvibe') $(pgrep -x pmp2sdp); do kill $p 2>/dev/null; done
     sleep 5
 }
 
-# one hyperion run of $PROG until its (parked) sdpb call; sets OBJ, NSV, SDPARGS
+# one hyperion run of $PROG until its PMP is written (hyperion's own pmp2sdp / sdpb calls are not needed:
+# they are run below); sets OBJ, NSV
 run_point() {   # label
     local L=$1
-    rm -f /root/hyp/sdpb_calls.log
-    local t0=$(date +%s)
+    local before=$(ls /root/hyp/data/*/ 2>/dev/null | sort)
+    local t0=$(date +%s) id="" ok=0
     ( cd $ST && setsid nohup $EXE master -p $PROG > ~/BlocksviBe/results/${L}_master.out 2>&1 < /dev/null & )
-    local ok=0
     while true; do
-        sleep 30
-        [ -s /root/hyp/sdpb_calls.log ] && { ok=1; break; }
-        pgrep -x stress-tensors- > /dev/null || break
+        sleep 20
+        [ -n "$id" ] || id=$(comm -13 <(echo "$before") <(ls /root/hyp/data/*/ 2>/dev/null | sort) | grep -v '^$' | head -1)
+        [ -n "$id" ] && grep -q "Finished computing SDP Part" -r /root/hyp/logs/*/$id 2>/dev/null && { ok=1; break; }
+        pgrep -f stress-tensors-3d-exec > /dev/null || break
     done
     local t1=$(date +%s)
-    [ $ok = 1 ] || { log "FAILED $L: hyperion exited before the SDP: $(tail -5 results/${L}_master.out | tr '\n' ' ')"; return 1; }
-    SDPARGS=$(head -1 /root/hyp/sdpb_calls.log)
     stop_hyperion
-    local SDP=$(echo "$SDPARGS" | grep -o -- '-s [^ ]*' | head -1 | cut -c4-); SDP=${SDP%/}
-    OBJ=$(dirname "$SDP"); NSV=$(ls $OBJ/json/obj/*.nsv 2>/dev/null | head -1)
+    [ $ok = 1 ] || { log "FAILED $L: hyperion exited before the PMP: $(tail -5 results/${L}_master.out | tr '\n' ' ')"; return 1; }
+    OBJ=$(ls -d /root/hyp/data/*/$id/Object_* | head -1); NSV=$(ls $OBJ/json/obj/*.nsv 2>/dev/null | head -1)
     local BD=$OBJ/blocks
-    log "$L: SDP built in $(( (t1 - t0) / 60 )) min ($((t1 - t0)) s) incl. blocks + composites + PMP + pmp2sdp; $(ls -d $BD/blocks_3d_tables_* | wc -l) block tables, $(du -sh $BD | cut -f1); obj $OBJ"
+    log "$L: PMP built in $(( (t1 - t0) / 60 )) min ($((t1 - t0)) s) incl. blocks + composites + PMP; $(ls -d $BD/blocks_3d_tables_* | wc -l) block tables, $(du -sh $BD | cut -f1); obj $OBJ"
     python3 - $BD >> $LOG <<'EOF'
 import glob, os, sys
 ds = glob.glob(sys.argv[1] + "/blocks_3d_tables_*")
@@ -102,16 +110,23 @@ EOF
 }
 
 # ---------------------------------------------------------------- 2. A: official blocks_3d
+if [ "${SKIP_A:-0}" = 1 ]; then
+    log "A: resumed (obj $OBJ_A)"
+else
 log "== A: $PROG with the official blocks_3d (+ jemalloc)"
 if run_point A; then
-    OBJ_A=$OBJ; NSV_A=$NSV; ARGS_A=$SDPARGS
+    OBJ_A=$OBJ; NSV_A=$NSV
     mkdir -p /root/sampleA
     for d in $(ls -d $OBJ_A/blocks/blocks_3d_tables_* | sort | awk 'NR % 50 == 1'); do cp -r $d /root/sampleA/; done
-    log "A: kept $(ls /root/sampleA | wc -l) block tables as a sample ($(du -sh /root/sampleA | cut -f1)); sdpb args: $ARGS_A"
+    log "A: kept $(ls /root/sampleA | wc -l) block tables as a sample ($(du -sh /root/sampleA | cut -f1))"
     rm -rf $OBJ_A/blocks                                      # disk: the B run writes as much again
+fi
 fi
 
 # ---------------------------------------------------------------- 3. B: BlocksviBe drop-in
+# hyperion keeps the point-independent TTTT results in a central store: move A's aside, so that B
+# recomputes every blocks_3d task (550 TTTT + 94 per-point at nmax=6) with the drop-in
+[ -d /root/hyp/data/tttt_blocks ] && mv /root/hyp/data/tttt_blocks /root/hyp/data/tttt_blocks_A
 cat > $C/blocks_3d.sh <<EOF
 #!/bin/bash
 export BLOCKSVIBE_FALLBACK=$B3 BLOCKSVIBE_JEMALLOC=$JE BLOCKSVIBE_PYTHON=$PY BLOCKSVIBE_VERBOSE=1
@@ -123,7 +138,7 @@ chmod +x $C/blocks_3d.sh
 ( nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader -l 30 > results/B_gpu_util.log 2>&1 & )
 log "== B: $PROG with BlocksviBe (GPU)"
 if run_point B; then
-    OBJ_B=$OBJ; NSV_B=$NSV; ARGS_B=$SDPARGS
+    OBJ_B=$OBJ; NSV_B=$NSV
     log "B: drop-in calls $(wc -l < /root/hyp/blocks_calls.log); spool batches: $(grep -c 'spool leader' /root/hyp/blocksvibe_stderr.log), sizes $(grep -o 'batch of [0-9]*' /root/hyp/blocksvibe_stderr.log | awk '{print $3}' | sort -n | uniq -c | tr '\n' ' '); fallbacks: $(grep -c 'fallback to' /root/hyp/blocksvibe_stderr.log); GPU failures: $(grep -c 'GPU run failed' /root/hyp/blocksvibe_stderr.log)"
     cp /root/hyp/blocksvibe_stderr.log /root/hyp/blocks_calls.log results/ 2>/dev/null
 fi

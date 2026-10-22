@@ -33,8 +33,6 @@ import sys
 import tempfile
 import time
 
-import numpy as np
-
 OPTS = {  # blocks_3d option -> (attribute, default); None = required
     "j-external": ("j_external", None), "j-internal": ("j_internal", None), "j-12": ("j12", None),
     "j-43": ("j43", None), "delta-12": ("delta_12", None), "delta-43": ("delta_43", None),
@@ -471,6 +469,7 @@ def _write(tasks, results):
 
 
 def _write_one(job):
+    import numpy as np
     from . import b3djson as BJ, structure as S
     i, tj = job
     t = _JOBS["tasks"][i]

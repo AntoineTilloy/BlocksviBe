@@ -255,8 +255,9 @@ at full order (positions D_i, shifts s_i), x = Delta - ub_j:
 * `shift_fraction` + `together_with_factors`: numerator_e(x) = P_e(x + ub) Pi(x) + sum_i a_i[e] Pi_i(x)
   is **one batched GEMM per spin chunk** with A_j = [Pi(x)(x + ub)^t, t <= R | Pi_i(x)] (K = R + 1 +
   poles), built exactly in integers (in y = 2x the roots are integers <= 0: products and exact synthetic
-  division) and rounded once.  Pole shifting (kept_pole_order < order) is not ported: the stress-tensor
-  programs use kept_pole_order = order.
+  division) and rounded once.  Pole shifting (kept_pole_order < order; the stress-tensor programs do use
+  it, e.g. order 60 / kept 14 at nmax=6, contrary to what this section first assumed) is folded into the
+  same matrix since 2026-10-22 (section 9).
 * Validation (`check_derivs.py`, recycled slots, h_inf from the dump): TTTT j12 = j43 = 2, q4 =
   (1,2,1,0), order 16, Lambda 7, j 0..10, blocks_3d at 256 bits, GPU 318 bits, n = 0, 2, 4, 6 as one
   batch: all 2,460 numerator polynomials agree to **2^-261.3 relative to their largest coefficient**
@@ -490,7 +491,8 @@ In order of value per effort.  Effort figures are rough.
 4. **GPU block engine** (2-4 weeks, in `blocksvibe/`), driven by the plan/kernels prototyped here:
    * production plan builder -- **done 2026-10-21** (vectorised, 6.3 s at order 152) -- and constants
      (M matrices, h_inf) from blocks_3d's own init (via the dump patch, or a small C++ library entry
-     point; h_inf is the one blocks_3d stage not ported, 2.3 core-s per right-hand side at order 52);
+     point; h_inf is the one blocks_3d stage not ported, 2.3 core-s per right-hand side at order 52)
+     -- **done 2026-10-22** with the `b3d_setup` helper (section 9);
    * memory: free Cauchy columns after use and accumulate derivative moments on the fly (section 5)
      -- **done 2026-10-21** (`Plan(reuse=True)`, `Derivs.accumulate`); B = 1-2 right-hand sides per
      24 GB card at nmax=22-26, or host-RAM streaming for larger B (the moments can already be moved to
@@ -498,9 +500,8 @@ In order of value per effort.  Effort figures are rough.
    * kernels: warp-cooperative, fused pole step (gather + q L H R^T + normalise; today 222 registers per
      thread at 926 bits), residue tables for the RNS Cauchy step at small B; the post-recursion
      stages up to the `Log_r_Derivatives` numerators are **done 2026-10-21** (`derivatives.py`,
-     validated against blocks_3d; next: the moments kernel and small-K steps of section 6, pole shifting
-     if kept_pole_order < order is ever needed, and write_output's coordinate transforms, which are
-     fixed linear maps on the numerators too);
+     validated against blocks_3d; next: the moments kernel and small-K steps of section 6; pole shifting
+     and write_output's coordinate transforms are done too, section 9);
    * write_output -- **done 2026-10-21** (xt, xt_radial; blocks_3d-compatible JSON writer, validated);
      next: output straight into composite blocks / PMP pieces (no JSON; blocks_3d's write_output with
      JSON is 46% of its time at order 52), validated against SDPB results at nmax=6-10;
@@ -531,3 +532,78 @@ a host whose network failed; $0.89 in total for these tests).  Raw logs: results
 Raw logs: results/vast_chain/ (not in the repository).
 Raw logs of the rental are not in the repository (results/ is ignored); the numbers above are copied
 from them.
+
+## 9. The package and the drop-in blocks_3d (2026-10-22)
+
+The GPU code left SDPviBe for its own repository, BlocksviBe (this one; history kept with git
+filter-repo), like blocks_3d is separate from SDPB: it imports only `sdpvibe.mpf` / `sdpvibe.rns`.
+`bin/blocks_3d` (`blocksvibe/cli.py`) takes blocks_3d's command line and param file and writes its files.
+
+* **Setup data (M matrices, h_infinity)**: from `b3d_setup` (`csrc/`), a ~250-line C++ main linked against
+  blocks_3d's own sources (Clebsch-Gordan, M_Matrix, Pole_Types, Wigner cache, F_Q / F_SO3 bases,
+  h_infinity).  Chosen over a port because (i) these stages are ~800 lines of convention-heavy code whose
+  port could only be validated against the same dumps, (ii) they are cheap (M: 7.5 s single-threaded per
+  task at order 60 in blocks_3d, h_inf ~1-3% of a task) and now cached / overlapped: M is written to a
+  disk cache per (group, four-point parity) and shared by the 22 q4 tasks of a group, h_inf runs on the
+  CPU while other tasks use the GPU, (iii) the inputs are then bit-identical to blocks_3d's.  It writes
+  GMP limbs in binary; `setup.py` turns them into MPF tensors on the GPU.  Checked against the
+  instrumented blocks_3d's dumps (`tools/check_setup.py`).  A GPU h_inf is the obvious next step if the
+  setup ever shows up in profiles at nmax=22-26.
+* **Pole shifting** (`derivatives.py`): blocks_3d replaces the residues at the unprotected poles x_i by
+  residues at the kept poles k (the poles at kept_pole_order) through an LU solve, a' = A^-1 V a with
+  A_rk = keep_k^(r-h), V_ri = x_i^(r-h), h = size/2.  Its closed form S_ki = (keep_k/x_i)^h l_k(x_i) (Lagrange
+  basis on the kept poles) is exact in rationals and folds into the numerator matrix (column i ->
+  sum_k S_ki Pi'_k over the new pole set): no extra GPU work.  The real stress-tensor programs use it
+  (nmax=6: order 60, kept_pole_order 14).
+* **Files**: `b3djson.py` reproduces write_header / write_derivs / write_profile byte for byte apart
+  from the digits (boost's mpf general format at digits10 of the limb-rounded precision through MPFR's
+  %.{p}g; blocks_3d's truncation of negligible top coefficients); spin files are formatted by a process
+  pool after the GPU is released.
+* **Batching**: hyperion calls blocks_3d once per four-point structure.  Concurrent calls of one group
+  meet in a spool directory; the holder of the group's leader lock waits for 3 quiet seconds, claims all
+  pending tasks and runs them as one batch (one setup run, one Plan / Recursion per pseudo-parity type and
+  sign, right-hand sides (q4) batched up to the free GPU memory, one lambda order at a time); the other
+  processes wait for their exit status.  A lock file per GPU serialises GPU use across groups.
+* **Fallback**: anything else (zzb, yyb, ws coordinates, no GPU, no helper, a failed GPU run) runs the
+  official binary ($BLOCKSVIBE_FALLBACK, with $BLOCKSVIBE_JEMALLOC preloaded).
+* **Validation against blocks_3d** (`tests/test_dropin.py`, laptop): TTTT, TTTe, T-sigma-T-sigma; xt,
+  xt_radial, both; signs +-1; pole shifting; a 4-task batch and 5 concurrent invocations (spool): same
+  files, layout and polynomial lengths, coefficients to 2^-252.5 (256 bits) / 2^-509 (512 bits).  At 384
+  bits blocks_3d's own result is off by 2^-350.7 from a 768-bit blocks_3d run and carries noise tails
+  (~1e-120 relative top coefficients where exact cancellations are expected, so some of its polynomials are
+  longer); the GPU result is 2^-374.6 from the 768-bit run.  The comparison tools drop tails below
+  2^-(prec-8) before comparing lengths.
+
+### End-to-end check on a real stress-tensor point (2026-10-22)
+
+`vast/st3d_ab.sh` on one rented box (EPYC 7742, 64 cores / 128 threads, 251 GB, one RTX 3090; 4.4 h,
+$2.8): stress-tensors-3d at 21dfcc0, program `TSigEps_test_nmax6` (feasibility at (Delta_sigma,
+Delta_eps) = (0.5181489, 1.412625) with a fixed OPE direction; blocks order 60, kept_pole_order 14,
+Lambda 11, 768 bits; SDP at 1024 bits), hyperion with fake Slurm, official binaries from the docker images.
+Raw logs: results/vast_st3d_ab/ (not in the repository).
+
+| run | blocks_3d tasks | blocks by | wall time to the PMP (blocks + composites + PMP) |
+|---|---|---|---|
+| A | 644 (550 TTTT + 94 per point: TTTe, TTss/TTee, sigma families with Delta_12, Delta_43 != 0) | official blocks_3d + jemalloc, 64 cores | 63.5 min (block tables over 49 min) |
+| B | 94 per point (hyperion reused A's TTTT results from its central store) | BlocksviBe on the 3090 | 13.5 min |
+| B2 | all 644 (central TTTT store moved aside) | BlocksviBe on the 3090 | not finished (below) |
+
+* **PMP A vs B** (`tools/compare_pmp.py`): 115 PMP files, 3,174,680 numbers, max relative error
+  **2^-758.1** per vector at 768-bit blocks, no structural difference.  B: 94 drop-in calls in 27 spool
+  batches (sizes 1-9: the TTTe groups batch their 9 q4), no fallback, no GPU failure.
+* **Solve**: SDPviBe on A's SDP (3090): "found primal feasible solution" in 19.4 min, the verdict of
+  official SDPB on the same program and point on 2026-10-13 (115 iterations).  B was not solved
+  separately (its PMP equals A's to 2^-758; the box time went to B2), nor was official SDPB run.
+* **TTTT tables on the GPU (B2)**: 421 of 644 calls ran in ~14 min, then the box ran out of threads:
+  ~70 waiting drop-in processes each started OpenBLAS's pool of 128 threads at `import numpy`, next to
+  hyperion's workers; one task failed to spawn (`posix_spawnp: Operation not permitted`), hyperion put the
+  run on hold, and later its own workers failed to create threads.  Fixed since (one BLAS/OpenMP thread
+  per drop-in process, numpy imported only where used).  The TTTT tables B2 finished agree with A's:
+  4 tables (33,054 / 18,354 / 33,054 / 7,644 polynomials; j12 != j43 included) to **2^-764.7 .. 2^-767.2
+  relative to each spin's table**; the fifth (xt_radial, q4 = (0,0,1,1), j12 = 2, j43 = 3) vanishes
+  identically: every entry is rounding noise in both runs (A <= 1e-176, B2 <= 1e-190).
+* Lessons for the comparison tools: polynomials (or whole tables) that vanish by a selection rule are
+  printed by blocks_3d as rounding noise and agree with nothing at the per-polynomial level;
+  `compare_json.py` reports the error relative to each spin's table as well.
+* Pipeline issues found on the way (fixed in SDPviBe's `vast/st3d_setup.sh`): hyperion's pmp2sdp call
+  failed under fake Slurm (OpenMPI needs SLURM_TASKS_PER_NODE) and with `-n $(nproc)` = hardware threads.

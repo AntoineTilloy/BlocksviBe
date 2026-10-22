@@ -3,7 +3,10 @@ header fields (all but args / output_template) must be identical, the derivs nes
 polynomial's coefficient count identical once trailing coefficients below 2^-(prec - 8) of its largest are
 dropped (blocks_3d leaves rounding noise where exact cancellations are expected, e.g. at 384 bits: those
 polynomials come out longer, with ~1e-120 relative top coefficients), and coefficients equal to the
-precision (max error relative to the largest coefficient of the polynomial).  The text layout is compared
+precision (max error relative to the largest coefficient of the polynomial; also reported relative to the
+largest coefficient of the file, i.e. of the spin's table: polynomials that vanish by a selection rule are
+pure rounding noise in blocks_3d, e.g. ~1e-70 in a table whose entries reach 1e36, where the GPU result has
+other noise or exact zeros, so per-polynomial errors of order 1 there are not discrepancies).  The text layout is compared
 line by line with numbers masked and each polynomial's coefficient lines collapsed.
    python tools/compare_json.py <dir or glob A> <dir or glob B> [--prec bits]
 Files are paired by name.  Exit status 1 on any structural difference."""
@@ -53,7 +56,7 @@ def main():
     if set(a) != set(b):
         print("file sets differ:", sorted(set(a) ^ set(b))[:10]); sys.exit(1)
     worst, worst_at, npoly, bad, hist = mp.mpf(0), None, 0, 0, Counter()
-    layout_diff, nraw = 0, [0]
+    layout_diff, nraw, fworst = 0, [0], mp.mpf(0)
     noise = mp.mpf(2) ** -(prec - 8)
     for name in sorted(a):
         ja, jb = json.load(open(a[name])), json.load(open(b[name]))
@@ -69,8 +72,14 @@ def main():
                 i = next((i for i, (x, y) in enumerate(zip(la, lb)) if x != y), min(len(la), len(lb)))
                 print(f"{name}: text layout differs at line {i}: {la[i:i+1]} vs {lb[i:i+1]} ({len(la)} vs {len(lb)} lines)")
 
+        def fmax(x):
+            if isinstance(x, list):
+                return max((fmax(u) for u in x), default=mp.mpf(0))
+            return abs(mp.mpf(x)) if isinstance(x, str) else mp.mpf(0)
+        fscale = fmax(ja["derivs"]) or mp.mpf(1)
+
         def walk(x, y, path):
-            nonlocal worst, worst_at, npoly, bad
+            nonlocal worst, worst_at, npoly, bad, fworst
             if isinstance(x, list) and x and isinstance(x[0], str):
                 if not (isinstance(y, list) and y and isinstance(y[0], str)):
                     print(f"{name} {path}: polynomial vs {y}"); bad += 1; return
@@ -78,7 +87,11 @@ def main():
                 if len(xs) != len(ys):
                     nraw[0] += 1
                     xs, ys = trim(xs, noise), trim(ys, noise)
-                    if len(xs) != len(ys):
+                    n = max(len(xs), len(ys))                  # file-scale error over the padded polynomials
+                    fe = max(abs(u - v) for u, v in zip(xs + [mp.mpf(0)] * (n - len(xs)),
+                                                         ys + [mp.mpf(0)] * (n - len(ys)))) / fscale
+                    fworst = max(fworst, fe)
+                    if len(xs) != len(ys) and fe > 2 * noise:
                         print(f"{name} {path}: polynomial length {len(xs)} vs {len(ys)} after dropping noise")
                         bad += 1; return
                 big = max(abs(v) for v in xs)
@@ -88,6 +101,7 @@ def main():
                         bad += 1; print(f"{name} {path}: zero vs nonzero")
                     return
                 err = max(abs(u - v) for u, v in zip(xs, ys)) / big
+                fworst = max(fworst, err * big / fscale)
                 hist[int(mp.floor(mp.log(err, 2))) if err else -9999] += 1
                 if err > worst:
                     worst, worst_at = err, f"{name} {path}"
@@ -97,8 +111,9 @@ def main():
             for i, (u, v) in enumerate(zip(x, y)):
                 walk(u, v, path + [i])
         walk(ja["derivs"], jb["derivs"], [])
-    print(f"{len(a)} files, {npoly} polynomials: max error relative to the largest coefficient "
-          f"2^{mp.nstr(mp.log(worst, 2), 4) if worst else '-inf'} ({worst_at}); structural differences: {bad}; "
+    print(f"{len(a)} files, {npoly} polynomials: max error relative to the largest coefficient of the polynomial "
+          f"2^{mp.nstr(mp.log(worst, 2), 4) if worst else '-inf'} ({worst_at}), of the file "
+          f"2^{mp.nstr(mp.log(fworst, 2), 4) if fworst else '-inf'}; structural differences: {bad}; "
           f"files with a different text layout: {layout_diff}; polynomials of different raw length (noise tails "
           f"below 2^-{prec - 8}): {nraw[0]}")
     print("log2 error histogram:", dict(sorted(hist.items())))
