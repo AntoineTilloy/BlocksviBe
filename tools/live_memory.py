@@ -1,10 +1,10 @@
 """Memory of the batched recursion per right-hand side: all residue slots (what blocks_3d keeps) vs the
 peak of residues still needed as Cauchy columns (slot (m, j, P) lives until level m + shift(P)), plus
 derivative moments sum_m m^k r_c^m res for internal spins (k <= R).
-   python tools/blocks/live_memory.py two_j12 two_j43 j_max order bits R"""
+   python tools/live_memory.py two_j12 two_j43 j_max order bits R"""
 import sys
 import numpy as np
-from sdpvibe.blocks import structure as S
+from blocksvibe import structure as S
 
 tj12, tj43, jmax, order, bits, R = map(int, sys.argv[1:])
 tjmax = 2 * jmax

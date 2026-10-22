@@ -52,7 +52,7 @@ vast.ai: Threadripper 3960X + RTX 3090, 2026-10-20); everything else is labelled
    step).  All later stages (residues -> log r derivatives, r^Delta restoration, Delta -> x shift,
    "together" into numerator polynomials, coordinate transforms) are fixed linear maps too.
 
-4. **GPU prototype** (`sdpvibe/blocks/`): the batched recursion (CUDA-core kernels for the Cauchy and
+4. **GPU prototype** (`blocksvibe/`): the batched recursion (CUDA-core kernels for the Cauchy and
    pole steps, RNS/INT8 GEMMs as an alternative), **validated against an instrumented blocks_3d**
    (residues agree to 2^-262 relative at 256 bits, two n batched; the only differing entries are
    blocks_3d's own cancellation noise, which the exact CPU port reproduces).  **Measured on an RTX 3090
@@ -167,15 +167,15 @@ group: computing it once per group is a free CPU-side saving.
 
 ## 4. GPU blocks: design and prototype
 
-`sdpvibe/blocks/structure.py` (pole/spin bookkeeping, 1:1 port), `recursion_ref.py` (exact CPU port of
+`blocksvibe/structure.py` (pole/spin bookkeeping, 1:1 port), `recursion_ref.py` (exact CPU port of
 `fill_residues`, mpmath), `recursion_gpu.py` (batched GPU recursion), `cauchy.py` and `smallgemm.py`
-(CUDA-core kernels), `dump.py` + `tools/blocks/b3d_dump.patch` (instrumented blocks_3d: dumps M matrices,
-h_inf and residues when `B3D_DUMP=<prefix>`).  Checks: `tools/blocks/check_ref.py`, `check_gpu.py` (vs
+(CUDA-core kernels), `dump.py` + `tools/b3d_dump.patch` (instrumented blocks_3d: dumps M matrices,
+h_inf and residues when `B3D_DUMP=<prefix>`).  Checks: `tools/check_ref.py`, `check_gpu.py` (vs
 dumps), `tests/test_blocks_recursion.py` (GPU vs exact port, all kernel variants).  Benchmarks:
-`tools/blocks/bench_recursion.py`, `bench_cauchy.py`, `bench_shapes.py`, `opcount.py`, `live_memory.py`.
-Post-recursion stages: `derivatives.py`; checks `tools/blocks/check_derivs.py` (vs the numerators dumped
+`tools/bench_recursion.py`, `bench_cauchy.py`, `bench_shapes.py`, `opcount.py`, `live_memory.py`.
+Post-recursion stages: `derivatives.py`; checks `tools/check_derivs.py` (vs the numerators dumped
 by the patched blocks_3d), `tests/test_blocks_derivatives.py` (vs an mpmath port of blocks_3d's code);
-benchmark `tools/blocks/bench_derivs.py`.
+benchmark `tools/bench_derivs.py`.
 
 * Plan (CPU, once per operator): slot layout of all residues (slot = parity, level, spin, pole), per level
   the (src, j') groups with their Cauchy rows D' and columns (prime poles), and per task the indices of
@@ -487,7 +487,7 @@ In order of value per effort.  Effort figures are rough.
      spin for all derivatives; binary output (mantissa + exponent) next to JSON.
 3. **Hyperion/Haskell** (2-5 days; section 7): shared store for point-independent tables and chunks,
    parse once and in C, shift once.  ~725 -> ~100 core-h per point at nmax=26.
-4. **GPU block engine** (2-4 weeks, in `sdpvibe/blocks/`), driven by the plan/kernels prototyped here:
+4. **GPU block engine** (2-4 weeks, in `blocksvibe/`), driven by the plan/kernels prototyped here:
    * production plan builder -- **done 2026-10-21** (vectorised, 6.3 s at order 152) -- and constants
      (M matrices, h_inf) from blocks_3d's own init (via the dump patch, or a small C++ library entry
      point; h_inf is the one blocks_3d stage not ported, 2.3 core-s per right-hand side at order 52);

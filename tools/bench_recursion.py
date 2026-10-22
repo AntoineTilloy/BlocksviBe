@@ -1,9 +1,9 @@
 """Time the batched GPU recursion on a synthetic operator (random M, h_inf) of production shape.
-   python tools/blocks/bench_recursion.py two_j12 two_j43 two_j_max order L B1 [B2 ...]
+   python tools/bench_recursion.py two_j12 two_j43 two_j_max order L B1 [B2 ...]
    env: CAUCHY=auto|cuda|rns  POLE=cuda|gemm|elementwise  CHUNK=<tasks per pole-step chunk>"""
 import os, sys, time
 import torch
-from sdpvibe.blocks import recursion_gpu as RG
+from blocksvibe import recursion_gpu as RG
 
 tj12, tj43, tjmax, order, L = map(int, sys.argv[1:6])
 Bs = list(map(int, sys.argv[6:]))

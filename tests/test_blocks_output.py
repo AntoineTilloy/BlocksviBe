@@ -1,13 +1,13 @@
-"""write_output on the GPU (sdpvibe/blocks/output.py: one composite matrix per (Lambda, parity, Delta_1+2))
+"""write_output on the GPU (blocksvibe/output.py: one composite matrix per (Lambda, parity, Delta_1+2))
 vs a line-by-line mpmath port of blocks_3d's lambda_lr_to_lrho_lrhob, congruence_transform (stirling, rho_z,
 power_prefactor), zzb_to_xt and lrho_to_xt_radial, on random numerator coefficients.
-(Checked against blocks_3d's JSON output with tools/blocks/check_output.py.)
+(Checked against blocks_3d's JSON output with tools/check_output.py.)
    python tests/test_blocks_output.py"""
 import random
 import mpmath as mp
 import torch
 from sdpvibe import mpf
-from sdpvibe.blocks import output as OUT
+from blocksvibe import output as OUT
 
 
 def congruence(parity, T, inp):

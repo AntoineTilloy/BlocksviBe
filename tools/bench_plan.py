@@ -1,8 +1,8 @@
 """Build time and memory of the vectorised recursion plan (recursion_gpu.Plan, slot reuse) at production
-shapes.   python tools/blocks/bench_plan.py two_j12 two_j43 j_max order"""
+shapes.   python tools/bench_plan.py two_j12 two_j43 j_max order"""
 import resource, sys, time
 import torch
-from sdpvibe.blocks import recursion_gpu as RG
+from blocksvibe import recursion_gpu as RG
 
 tj12, tj43, jmax, order = map(int, sys.argv[1:5])
 t0 = time.time()
@@ -16,7 +16,7 @@ print(f"2j12={tj12} 2j43={tj43} j_max={jmax} order={order}: plan {t1 - t0:.1f} s
       f"{tasks:.3g} tasks, {2 * plan.nslots:.3g} logical / {plan.nphys:.3g} physical slots, {len(plan.Mkeys)} M keys, "
       f"dense Cauchy tables would be {dense:.3g} entries ({dense * 12 / 1e9:.1f} GB as cdiff+cidx)")
 if len(sys.argv) > 6:                                   # also the derivative-stage constants: R L
-    from sdpvibe.blocks import derivatives as DV
+    from blocksvibe import derivatives as DV
     R, L = int(sys.argv[5]), int(sys.argv[6])
     t2 = time.time()
     der = DV.Derivs(plan, R, L)

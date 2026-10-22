@@ -4,9 +4,9 @@ identical index tensors, keys, slot layout and physical slot mapping, with and w
 import time
 import numpy as np
 import torch
-from sdpvibe.blocks import recursion_gpu as RG
-from sdpvibe.blocks.plan_ref import PlanRef
-from sdpvibe.blocks import structure as S, derivatives as DV
+from blocksvibe import recursion_gpu as RG
+from blocksvibe.plan_ref import PlanRef
+from blocksvibe import structure as S, derivatives as DV
 
 CASES = [(8, 8, 30, 30, ((0, 0), (1, 1))), (4, 2, 20, 24, ((0, 1), (1, 0))), (3, 1, 9, 12, ((0, 1), (1, 1))),
          (5, 5, 11, 10, ((1, 0), (0, 1))), (4, 4, 20, 16, ((0, 0), (1, 1))), (0, 0, 6, 8, ((0, 0), (1, 1))),

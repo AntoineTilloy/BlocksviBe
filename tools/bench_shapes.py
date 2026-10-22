@@ -1,9 +1,9 @@
 """Throughput of sdpvibe.mpf.gemm at the shapes of the batched blocks recursion.
-   python tools/blocks/bench_shapes.py [L]   (L=29 limbs -> 926-bit mantissas)"""
+   python tools/bench_shapes.py [L]   (L=29 limbs -> 926-bit mantissas)"""
 import sys, time
 import torch
 from sdpvibe import mpf
-from sdpvibe.blocks.recursion_gpu import bgemm
+from blocksvibe.recursion_gpu import bgemm
 from sdpvibe.rns import dev
 
 L = int(sys.argv[1]) if len(sys.argv) > 1 else 29

@@ -2,14 +2,14 @@
 depend on the values): for each lambda order n of one task (four-point structure), recursion + derivative
 moments + numerators (Derivs with R = Lambda - n), numerators staged per spin chunk on disk, then write_output
 (xt) per spin chunk over all n.  Per right-hand side = per (task, n).
-   python tools/blocks/bench_chain.py two_j12 two_j43 j_max order Lambda L spin_chunk stage_dir
+   python tools/bench_chain.py two_j12 two_j43 j_max order Lambda L spin_chunk stage_dir
    env: OFFLOAD=1 (moments to the host before the final GEMMs), TASK_CHUNK (pole-step tasks per launch),
         ORDERS=n1,n2,... (time only these lambda orders, no staging / write_output: bench_output.py)"""
 import os, shutil, sys, time
 import numpy as np
 import torch
 from sdpvibe import mpf
-from sdpvibe.blocks import recursion_gpu as RG, derivatives as DV, output as OUT
+from blocksvibe import recursion_gpu as RG, derivatives as DV, output as OUT
 
 tj12, tj43, jmax, order, Lam, L, chunk = map(int, sys.argv[1:8])
 stage = sys.argv[8]

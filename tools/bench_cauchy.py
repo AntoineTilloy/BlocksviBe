@@ -1,10 +1,10 @@
 """Cauchy step alone: CUDA-core kernel (2/integer coefficients) vs RNS GEMM, per output entry.
-   python tools/blocks/bench_cauchy.py [L]"""
+   python tools/bench_cauchy.py [L]"""
 import sys, time
 import torch
 from sdpvibe import mpf
-from sdpvibe.blocks.cauchy import cauchy
-from sdpvibe.blocks.recursion_gpu import bgemm, random_mpf
+from blocksvibe.cauchy import cauchy
+from blocksvibe.recursion_gpu import bgemm, random_mpf
 from sdpvibe.rns import dev
 
 L = int(sys.argv[1]) if len(sys.argv) > 1 else 29

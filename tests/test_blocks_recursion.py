@@ -1,12 +1,12 @@
-"""Batched GPU blocks recursion (sdpvibe/blocks/recursion_gpu.py) vs the exact CPU port of blocks_3d's
+"""Batched GPU blocks recursion (blocksvibe/recursion_gpu.py) vs the exact CPU port of blocks_3d's
 fill_residues (recursion_ref.py) on a random operator and random initial data (several right-hand sides).
-(The CPU port itself is checked against an instrumented blocks_3d with tools/blocks/check_ref.py.)
+(The CPU port itself is checked against an instrumented blocks_3d with tools/check_ref.py.)
    python tests/test_blocks_recursion.py"""
 import random
 import mpmath as mp
 import torch
 from sdpvibe import mpf
-from sdpvibe.blocks import recursion_gpu as RG, recursion_ref, structure as S
+from blocksvibe import recursion_gpu as RG, recursion_ref, structure as S
 
 
 def test(tj12=4, tj43=2, tjmax=6, order=7, L=10, B=3, seed=1, **opts):

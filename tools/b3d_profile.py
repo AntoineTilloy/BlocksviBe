@@ -1,5 +1,5 @@
 """Summarise a blocks_3d .profile file by stage (summed over lambda orders / threads).
-   python tools/blocks/b3d_profile.py <spin_0.json.profile>"""
+   python tools/b3d_profile.py <spin_0.json.profile>"""
 import re, sys, collections
 agg = collections.defaultdict(float)
 for line in open(sys.argv[1]):

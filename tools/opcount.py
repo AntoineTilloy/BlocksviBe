@@ -1,5 +1,5 @@
 """Operation counts of blocks_3d's radial recursion per lambda order (replicates fill_residues' loops;
-   reproduces its per-level task counts).  python tools/blocks/opcount.py two_j12 two_j43 j_max order"""
+   reproduces its per-level task counts).  python tools/opcount.py two_j12 two_j43 j_max order"""
 import sys
 def bosonic(tj): return tj%2==0
 def prk(t,tj,tj12,tj43,order):

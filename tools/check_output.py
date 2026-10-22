@@ -1,8 +1,8 @@
 """End-to-end check of the GPU block chain against blocks_3d's JSON output: recursion (M matrices and h_inf
-from an instrumented blocks_3d run, tools/blocks/b3d_dump.patch) -> derivatives/numerators -> write_output
-(sdpvibe/blocks/output.py) -> blocks_3d-style JSON files, compared per spin, structure, coordinate and
+from an instrumented blocks_3d run, tools/b3d_dump.patch) -> derivatives/numerators -> write_output
+(blocksvibe/output.py) -> blocks_3d-style JSON files, compared per spin, structure, coordinate and
 derivative with the files blocks_3d wrote (same task, same output template).
-   python tools/blocks/check_output.py <blocks_3d out template, e.g. dir/out_{}.json> <dump prefix>
+   python tools/check_output.py <blocks_3d out template, e.g. dir/out_{}.json> <dump prefix>
           two_j12 two_j43 two_j_max order Lambda four_pt_sign delta_1_plus_2 coords(xt,xt_radial) L bits
    (TTTT, q4 and Delta_12 = Delta_43 = 0 are read back from blocks_3d's JSON header)
    env PER_ORDER=1: one lambda order per recursion run (Derivs.for_order, output.apply_per_order)"""
@@ -11,7 +11,7 @@ from collections import defaultdict
 import mpmath as mp
 import torch
 from sdpvibe import mpf
-from sdpvibe.blocks import dump, recursion_gpu as RG, derivatives as DV, output as OUT
+from blocksvibe import dump, recursion_gpu as RG, derivatives as DV, output as OUT
 
 tmpl, pre = sys.argv[1], sys.argv[2]
 tj12, tj43, tjmax, order, Lam, sign = map(int, sys.argv[3:9])

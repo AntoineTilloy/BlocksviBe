@@ -2,7 +2,7 @@
 # Run ON the instance after vast/blocks_bench.sh (reuses its blocks_3d image + jemalloc): stage split of
 # blocks_3d (recursion / derivatives / shift / output) at larger orders, to know which stages a GPU
 # port must cover.  Appends to results/blocks_stages.log; touches results/STAGES_DONE.
-cd ~/SDPviBe
+cd ~/BlocksviBe
 LOG=results/blocks_stages.log
 R=$PWD/tools/b3d_root; JE=$PWD/tools/apk/usr/lib/libjemalloc.so.2; T=$(nproc)
 run() {   # run <label> args...
@@ -10,7 +10,7 @@ run() {   # run <label> args...
     local t0=$(date +%s)
     timeout ${TMAX:-3000} $R/lib/ld-musl-x86_64.so.1 --library-path "$R/usr/local/lib:$R/usr/lib:$R/lib" --preload $JE \
         $R/usr/local/bin/blocks_3d "$@" --num-threads=$T -o $O/spin_{}.json > $O.log 2>&1
-    echo "[$(date +%T)] $lab rc=$? wall $(( $(date +%s) - t0 )) s threads $T maxrss? out $(du -sh $O | cut -f1); $(python3 tools/blocks/b3d_profile.py $O/spin_0.json.profile 2>&1)" >> $LOG
+    echo "[$(date +%T)] $lab rc=$? wall $(( $(date +%s) - t0 )) s threads $T maxrss? out $(du -sh $O | cut -f1); $(python3 tools/b3d_profile.py $O/spin_0.json.profile 2>&1)" >> $LOG
 }
 C="--j-external=2,2,2,2 --delta-12=0 --delta-43=0 --delta-1-plus-2=6 --four-pt-sign=1 --coordinates=xt"
 # nmax=14-like (Lambda=27), full spin list, 2j12=2j43=8 and 4

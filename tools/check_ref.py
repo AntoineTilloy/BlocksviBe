@@ -1,9 +1,9 @@
-"""Check the reference recursion (sdpvibe/blocks/recursion_ref.py) against an instrumented blocks_3d dump.
-   python tools/blocks/check_ref.py <dump prefix> <n> two_j12 two_j43 two_j_max order prec_bits"""
+"""Check the reference recursion (blocksvibe/recursion_ref.py) against an instrumented blocks_3d dump.
+   python tools/check_ref.py <dump prefix> <n> two_j12 two_j43 two_j_max order prec_bits"""
 import sys, time
 import mpmath as mp
 from fractions import Fraction
-from sdpvibe.blocks import dump, recursion_ref
+from blocksvibe import dump, recursion_ref
 
 pre, n, tj12, tj43, tjmax, order, prec = sys.argv[1], *map(int, sys.argv[2:])
 mp.mp.prec = prec + 64

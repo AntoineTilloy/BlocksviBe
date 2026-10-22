@@ -1,10 +1,10 @@
-"""Timing of write_output on the GPU (sdpvibe/blocks/output.py, xt) for one task: composite-map construction
+"""Timing of write_output on the GPU (blocksvibe/output.py, xt) for one task: composite-map construction
 (once per Lambda, parity, Delta_1+2) and its application to synthetic numerators of every lambda order for a
 few spins (scaled to all spins).  Shapes as Derivs would produce them (poles of spin j_max at full order).
-   python tools/blocks/bench_output.py two_j12 two_j43 j_max order Lambda L spins"""
+   python tools/bench_output.py two_j12 two_j43 j_max order Lambda L spins"""
 import sys, time
 import torch
-from sdpvibe.blocks import recursion_gpu as RG, output as OUT, structure as S
+from blocksvibe import recursion_gpu as RG, output as OUT, structure as S
 
 tj12, tj43, jmax, order, Lam, L, J = map(int, sys.argv[1:8])
 NP = len(S.poles(2 * jmax, tj12, tj43, order))

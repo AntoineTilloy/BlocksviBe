@@ -1,13 +1,13 @@
-"""GPU recursion + post-recursion stages (sdpvibe/blocks/derivatives.py) vs the Log_r_Derivatives numerators
-dumped by an instrumented blocks_3d (tools/blocks/b3d_dump.patch: <prefix>_N<n>.txt), several lambda orders
+"""GPU recursion + post-recursion stages (blocksvibe/derivatives.py) vs the Log_r_Derivatives numerators
+dumped by an instrumented blocks_3d (tools/b3d_dump.patch: <prefix>_N<n>.txt), several lambda orders
 n as the batch, with the recycled slot buffer (Plan(reuse=True)).
-   python tools/blocks/check_derivs.py <dump prefix> two_j12 two_j43 two_j_max order Lambda L n1 [n2 ...]"""
+   python tools/check_derivs.py <dump prefix> two_j12 two_j43 two_j_max order Lambda L n1 [n2 ...]"""
 import sys, time
 from collections import defaultdict
 import mpmath as mp
 import torch
 from sdpvibe import mpf
-from sdpvibe.blocks import dump, recursion_gpu as RG, derivatives as DV
+from blocksvibe import dump, recursion_gpu as RG, derivatives as DV
 
 pre = sys.argv[1]
 tj12, tj43, tjmax, order, Lam, L = map(int, sys.argv[2:8])

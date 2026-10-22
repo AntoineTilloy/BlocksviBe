@@ -1,12 +1,12 @@
 """Check the batched GPU recursion against instrumented blocks_3d dumps (several n as the batch).
-   python tools/blocks/check_gpu.py <dump prefix> two_j12 two_j43 two_j_max order L n1 [n2 ...]
+   python tools/check_gpu.py <dump prefix> two_j12 two_j43 two_j_max order L n1 [n2 ...]
    Without residues in the dumps (B3D_DUMP_NORES) only timings are reported."""
 import sys, time
 import numpy as np
 import mpmath as mp
 import torch
 from sdpvibe import mpf
-from sdpvibe.blocks import dump, recursion_gpu as RG
+from blocksvibe import dump, recursion_gpu as RG
 
 pre = sys.argv[1]
 tj12, tj43, tjmax, order, L = map(int, sys.argv[2:7])

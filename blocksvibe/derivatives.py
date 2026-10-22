@@ -35,8 +35,8 @@ import torch
 
 from . import structure as S
 from .recursion_gpu import gemm as RG_gemm, bgemm, _take, _expand, _permute, _tick
-from .. import mpf
-from ..rns import dev
+from sdpvibe import mpf
+from sdpvibe.rns import dev
 
 _SRC = r"""
 // v[row_t, col, k] += n_t^k y[t, col] for k < R1 (y: normalised MPF, n_t < 2^31)

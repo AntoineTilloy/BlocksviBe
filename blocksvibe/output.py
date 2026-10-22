@@ -28,8 +28,8 @@ import torch
 
 from . import structure as S
 from .recursion_gpu import gemm as RG_gemm, _permute, _take
-from .. import mpf
-from ..rns import dev
+from sdpvibe import mpf
+from sdpvibe.rns import dev
 
 
 def _poch(a, n):
@@ -232,7 +232,7 @@ def write_json(path, outs, vals, tj, tj12, tj43, two_js, q4, sign, delta_12, del
          "four_pt_struct": [x / 2 for x in q4], "four_pt_sign": sign, "order": order, "lambda": Lam,
          "kept_pole_order": kept_pole_order, "coordinates": [o.coord for o in outs],
          "pole_list_x": [float(x) for x in poles], "precision_input": bits,
-         "j_internal_input": [x / 2 for x in two_js_int], "generator": "sdpvibe.blocks (GPU)"}
+         "j_internal_input": [x / 2 for x in two_js_int], "generator": "blocksvibe (GPU)"}
     Sm = int(round(vals[0].shape[2] ** 0.5))
     derivs = []
     for p in range(2):

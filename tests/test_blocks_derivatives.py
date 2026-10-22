@@ -1,13 +1,13 @@
-"""GPU post-recursion stages (sdpvibe/blocks/derivatives.py, moments accumulated during a recursion with a
+"""GPU post-recursion stages (blocksvibe/derivatives.py, moments accumulated during a recursion with a
 recycled slot buffer) vs a line-by-line mpmath port of blocks_3d's residues_to_derivatives, restore_r_delta
 (polynomial division by (Delta - D_i)), shift_fraction and together_with_factors, applied to the residues of
 the same recursion run without slot reuse.  Random operator and initial data, several right-hand sides.
-(Checked against an instrumented blocks_3d with tools/blocks/check_derivs.py.)
+(Checked against an instrumented blocks_3d with tools/check_derivs.py.)
    python tests/test_blocks_derivatives.py"""
 from math import comb
 import mpmath as mp
-from sdpvibe.blocks import recursion_gpu as RG, derivatives as DV, structure as S
-from sdpvibe.blocks.recursion_gpu import random_mpf
+from blocksvibe import recursion_gpu as RG, derivatives as DV, structure as S
+from blocksvibe.recursion_gpu import random_mpf
 
 
 def pmul(p, q):

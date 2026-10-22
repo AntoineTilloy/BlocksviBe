@@ -8,8 +8,8 @@ import cupy as cp
 import numpy as np
 import torch
 
-from .. import mpf
-from ..rns import dev
+from sdpvibe import mpf
+from sdpvibe.rns import dev
 
 _SRC = r"""
 typedef unsigned int u32; typedef unsigned long long u64; typedef long long i64;

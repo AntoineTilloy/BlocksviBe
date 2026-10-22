@@ -20,7 +20,7 @@ the batch dimension B, and each level m is
 Residues live in one slot buffer: logical slot = p * nslots + offset[m][jidx] + pole index, plus a zero
 slot.  With Plan(reuse=True) a logical slot is mapped to a physical one that is recycled once the residue
 has been read as a Cauchy column (its only later use; derivative moments are taken right after the
-level, sdpvibe/blocks/derivatives.py): the buffer holds the peak of live residues instead of all of them.
+level, blocksvibe/derivatives.py): the buffer holds the peak of live residues instead of all of them.
 All index tensors and constants are built once per operator (Plan, Recursion.__init__); run() only
 does GPU work and can be called for any number of right-hand-side batches.
 """
@@ -33,8 +33,8 @@ import torch
 from . import structure as S
 from .cauchy import cauchy as cauchy_kernel
 from .smallgemm import smallgemm
-from .. import mpf
-from ..rns import dev
+from sdpvibe import mpf
+from sdpvibe.rns import dev
 
 
 def _pad(A, dims):
