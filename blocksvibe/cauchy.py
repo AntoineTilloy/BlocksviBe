@@ -16,7 +16,7 @@ _SRC = r"""
 typedef unsigned int u32; typedef unsigned long long u64; typedef long long i64;
 #define L __L__
 #define LW (L + 3)
-extern "C" __global__ void cauchy(const int* X, const int* D, int* O, i64 nb, i64 Mr, i64 Kc, i64 N) {
+extern "C" __global__ void cauchy(const int* X, const int* D, int* O, i64 nb, i64 Mr, i64 Kc, i64 N, const u64* RINV, int dmax) {
     i64 t = blockIdx.x * (i64)blockDim.x + threadIdx.x;
     i64 tot = nb * Mr * N; if (t >= tot) return;
     i64 n = t % N, r = (t / N) % Mr, g = t / (N * Mr);
@@ -33,7 +33,7 @@ extern "C" __global__ void cauchy(const int* X, const int* D, int* O, i64 nb, i6
         if (neg) { u64 c = 1; for (int k = 0; k < L; k++) { u64 v = (u64)(~a[k]) + c; a[k] = (u32)v; c = v >> 32; } }
         if (d < 0) { neg = !neg; d = -d; }
         u64 ud = (u64)d;
-        u64 inv = 0xFFFFFFFFFFFFFFFFull / ud;          // one division per term; per limb: mulhi + correction
+        u64 inv = d <= dmax ? RINV[d] : 0xFFFFFFFFFFFFFFFFull / ud;   // reciprocal table: no 64-bit division
         // q = floor(|x| * 2^32 / d): limbs q[1..L] from a[0..L-1], q[0] from the appended zero limb
         u32 q[L + 1]; u64 rem = 0;
         for (int k = L; k >= 0; k--) {
@@ -52,6 +52,16 @@ extern "C" __global__ void cauchy(const int* X, const int* D, int* O, i64 nb, i6
 }
 """
 _mods = {}
+_rinv = {}
+DMAX = 4096                                           # reciprocal table size (larger |D' - D_i|: one division)
+
+
+def _reciprocals():
+    """floor((2^64 - 1) / d) for d = 0..DMAX (entry 0 unused), on the GPU"""
+    if DMAX not in _rinv:
+        v = np.array([0] + [(2 ** 64 - 1) // d for d in range(1, DMAX + 1)], dtype=np.uint64)
+        _rinv[DMAX] = cp.asarray(v)
+    return _rinv[DMAX]
 
 
 def _kernel(L):
@@ -72,6 +82,6 @@ def cauchy(X, D):
     T = 128
     _kernel(L)(((tot + T - 1) // T,), (T,),
                (cp.from_dlpack(Xm), cp.from_dlpack(D.to(torch.int32).contiguous()), cp.from_dlpack(W),
-                np.int64(nb), np.int64(Mr), np.int64(Kc), np.int64(N)))
+                np.int64(nb), np.int64(Mr), np.int64(Kc), np.int64(N), _reciprocals(), np.int32(DMAX)))
     ein = (E[:, None, :].expand(nb, Mr, N) - 31).reshape(-1)       # value = acc * 2^(E - 32 + 1)
     return mpf.normalize(W, ein.contiguous(), L).reshape(nb, Mr, N)
