@@ -24,8 +24,13 @@ above is the same quantity.)  Every map is linear with exact (dyadic rational) c
   3. numerators: batched GEMM over spins, A_j = [Pi_{j,i}(x) | Pi_j(x) (x+ub_j)^t (t <= R)], i.e. the
      Delta -> x shift and together_with_factors in one product, K = R + 1 + poles.
 
-Pole shifting (kept_pole_order < order) is not implemented: the stress-tensor runs use kept_pole_order =
-order.  All GEMMs are the RNS/INT8 tensor-core sdpvibe.mpf.gemm (normwise error, rounded once per entry).
+Pole shifting (kept_pole_order < order, what the stress-tensor programs use, e.g. order 60 / kept 14 at
+nmax=6): blocks_3d's shift_poles replaces the unprotected poles x_i != 0 by the kept ones k (the poles at
+kept_pole_order) with residues a'_k = sum_i S_ki a_i, S = A^-1 V, A_rk = keep_k^(r-h), V_ri = x_i^(r-h),
+r < size = #kept, h = size/2 (an LU solve at working precision in blocks_3d).  Here S has its closed form
+S_ki = (keep_k / x_i)^h l_k(x_i) (l_k: Lagrange basis on the kept poles), exact in rationals, and is folded
+into the numerator matrix: column i becomes sum_k S_ki Pi'_k(x) over the new pole set (protected poles stay
+as they are), so the GPU work is unchanged.  All GEMMs are the RNS/INT8 tensor-core sdpvibe.mpf.gemm (normwise error, rounded once per entry).
 """
 from math import comb
 import cupy as cp
@@ -238,6 +243,61 @@ def _syndiv_all(p, roots):
     return [list(q[:, i]) for i in range(len(roots))]
 
 
+def _div_round(v, den, bits, e):
+    """v / den * 2^e (integers, den > 0) -> (m, e') with m ~ bits bits, m 2^e' rounded to nearest"""
+    if v == 0:
+        return 0, 0
+    a = abs(v)
+    sh = max(0, bits + den.bit_length() - a.bit_length())
+    m = ((a << sh) + den // 2) // den
+    return (-m if v < 0 else m), e - sh
+
+
+def _shift_columns(roots, new, comp, npj):
+    """numerator columns for blocks_3d's pole shifting (roots: old poles y_i = 2 x_i; new: protected old
+    poles then the kept ones; comp[k] = Pi_new / (y - new_k), integer polynomials).  Old protected pole i
+    -> comp of its slot; old unprotected pole i -> sum_k S_ki comp[nprot + k], S_ki = (y'_k / y_i)^h l_k(y_i)
+    with y'_k the kept unprotected poles, h = size // 2 (scale invariant, so y = 2x is fine), as
+    (integer polynomial, denominator): numerator_k = y'_k^h prod_{m!=k} (y_i - y'_m) (D / D_k),
+    D_k = prod_{m!=k} (y'_k - y'_m), D = lcm D_k, denominator y_i^h D (sign moved to the numerator)."""
+    from math import lcm
+    nprot = sum(1 for y in new if y == 0)
+    keep = new[nprot:]
+    size = len(keep)
+    h = size // 2
+    Dk = [1] * size
+    for k in range(size):
+        for m in range(size):
+            if m != k:
+                Dk[k] *= keep[k] - keep[m]
+    D = 1
+    for d in Dk:
+        D = lcm(D, abs(d))
+    fac = [keep[k] ** h * (D // Dk[k]) for k in range(size)]           # exact (Dk divides D up to sign)
+    Q = np.array([comp[nprot + k] for k in range(size)], dtype=object).reshape(size, -1) if size else None
+    cols = []
+    for i, y in enumerate(roots):
+        if y == 0:
+            cols.append((i, comp[new.index(0)], npj - 1, 1))
+            continue
+        if size == 0:                                                  # nothing kept: the pole is dropped
+            cols.append((i, [0], npj - 1, 1))
+            continue
+        w = np.empty(size, dtype=object)
+        for k in range(size):
+            prod = fac[k]
+            for m in range(size):
+                if m != k:
+                    prod *= y - keep[m]
+            w[k] = prod
+        poly = list(w.dot(Q))
+        den = y ** h * D
+        if den < 0:
+            den, poly = -den, [-c for c in poly]
+        cols.append((i, poly, npj - 1, den))
+    return cols
+
+
 def _syndiv(p, root):
     """p(y) / (y - root) for a root of p (exact), integer coefficients"""
     n = len(p) - 1
@@ -254,15 +314,17 @@ class Derivs:
     """Post-recursion stages for one recursion Plan (any batch of right-hand sides with lambda orders
     n >= Lambda - R).  two_js: internal spins to output (default: all two_j <= two_j_max)."""
 
-    def __init__(self, plan, R, L, two_js=None):
+    def __init__(self, plan, R, L, two_js=None, kept_pole_order=None):
         self.plan, self.R, self.L = plan, R, L
+        self.kept = kept_pole_order if kept_pole_order is not None and kept_pole_order < plan.order else None
         pl, order = plan, plan.order
         tj12, tj43, tjmax = pl.tj12, pl.tj43, pl.tjmax
         self.tjs = list(two_js) if two_js is not None else list(range(tj12 % 2, tjmax + 1, 2))
         Jo = self.Jo = len(self.tjs)
         self.poles = [S.poles(tj, tj12, tj43, order) for tj in self.tjs]
         NP = self.NP = max(len(p) for p in self.poles)
-        self.Dout = NP + R + 1
+        self.NPout = NP if self.kept is None else max(len(S.poles(tj, tj12, tj43, self.kept)) for tj in self.tjs)
+        self.Dout = self.NPout + R + 1
         # moment rows ((p * Jo + jo) * NP + i), per level: (physical slot, row, n = m + s_i)
         tjo = np.array(self.tjs, dtype=np.int64)
         self.levels = []
@@ -317,25 +379,41 @@ class Derivs:
         self._small_constants()
         # numerator matrix per spin: columns Pi_i(x), then Pi(x) (x + ub)^t (t <= R); in y = 2x the roots
         # y_i = 2 x_i are integers (<= 0), so everything is exact integer arithmetic, scaled at the end
+        # (with pole shifting: Pi over the new pole set, and column i = sum_k S_ki Pi'_k, exact rationals)
         Dout, W = self.Dout, R + 1 + NP
+        NB = mpf.NBITS(L)
         ints, exps = [0] * (Jo * Dout * W), [0] * (Jo * Dout * W)
         for jo, (tj, pl) in enumerate(zip(self.tjs, self.poles)):
             two_ub = tj + 1 if tj <= 1 else tj + 2
             roots = [S.delta_2(P, tj) - two_ub for P in pl]
-            npj = len(roots)
+            if self.kept is None:
+                new = roots
+            else:                                                     # protected (x = 0) old poles, then kept
+                new = [y for y in roots if y == 0] + \
+                      [S.delta_2(P, tj) - two_ub for P in S.poles(tj, self.plan.tj12, self.plan.tj43, self.kept)
+                       if S.delta_2(P, tj) != two_ub]
+            npj = len(new)
             Pi = [1]
-            for y0 in roots:
+            for y0 in new:
                 Pi = _polymul_lin(Pi, -y0)
             cols = []
             q = Pi
             for t in range(R + 1):                                    # 2^-(npj+t) Pi_y(y) (y + 2ub)^t
-                cols.append((NP + t, q, npj + t))
+                cols.append((NP + t, q, npj + t, 1))
                 q = _polymul_lin(q, two_ub)
-            cols += [(i, qi, npj - 1) for i, qi in enumerate(_syndiv_all(Pi, roots))]
-            for cc, poly, sc in cols:                                 # x^k coefficient: v 2^(k - sc)
+            comp = _syndiv_all(Pi, new) if new else []
+            if self.kept is None:
+                cols += [(i, qi, npj - 1, 1) for i, qi in enumerate(comp)]
+            else:
+                cols += _shift_columns(roots, new, comp, npj)
+            for cc, poly, sc, den in cols:                            # x^k coefficient: v / den 2^(k - sc)
                 base = jo * Dout * W + cc
-                ints[base:base + len(poly) * W:W] = poly
-                exps[base:base + len(poly) * W:W] = range(-sc, len(poly) - sc)
+                if den == 1:
+                    ints[base:base + len(poly) * W:W] = poly
+                    exps[base:base + len(poly) * W:W] = range(-sc, len(poly) - sc)
+                else:
+                    for k, v in enumerate(poly):
+                        ints[base + k * W], exps[base + k * W] = _div_round(v, den, NB + 8, k - sc)
         self.Anum = exact_mpf(ints, exps, L, (Jo, Dout, W))
 
     def _small_constants(self):
@@ -359,7 +437,7 @@ class Derivs:
         assert R <= self.R
         d = object.__new__(Derivs)
         d.__dict__.update(self.__dict__)
-        d.R, d.Dout = R, self.NP + R + 1
+        d.R, d.Dout = R, self.NPout + R + 1
         R1, K = R + 1, self.NP + R + 1                                # columns: Pi_i, then t <= R
         d.Anum = mpf.MPF(self.Anum.m[:, :, :d.Dout, :K], self.Anum.e[:, :d.Dout, :K])
         d.Ttab = mpf.MPF(self.Ttab.m[:, :, :R1, :R1].contiguous(), self.Ttab.e[:, :R1, :R1].contiguous())

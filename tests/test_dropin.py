@@ -24,6 +24,11 @@ CASES = {   # name: (blocks_3d options without -o, precision for the comparison)
     "ttte_xt": ("--j-external 2,2,2,0 --j-12 2 --j-43 2 --delta-12 0 --delta-43 -1.5874 --j-internal 0-9,12"
                 " --delta-1-plus-2 6 --four-pt-struct 1,0,2,0 --four-pt-sign -1 --order 18 --lambda 9"
                 " --coordinates xt --kept-pole-order 18 --precision 384", 384),
+    "tttt_shift": (TTTT + " --j-internal 0-12 --delta-1-plus-2 6 --four-pt-struct 1,2,1,0 --four-pt-sign 1"
+                   " --order 30 --lambda 9 --coordinates xt --kept-pole-order 8 --precision 512", 512),
+    "ttte_shift_radial": ("--j-external 2,2,2,0 --j-12 4 --j-43 2 --delta-12 0 --delta-43 -1.5874 --j-internal 0-10"
+                          " --delta-1-plus-2 6 --four-pt-struct 2,0,2,0 --four-pt-sign -1 --order 24 --lambda 11"
+                          " --coordinates xt_radial --kept-pole-order 6 --precision 512", 512),
     "tsts_both": ("--j-external 2,0,0,2 --j-12 2 --j-43 2 --delta-12 2.4819 --delta-43 2.4819 --j-internal 0-8"
                   " --delta-1-plus-2 3.5181 --four-pt-struct 1,0,0,-1 --four-pt-sign 1 --order 14 --lambda 9"
                   " --coordinates xt,xt_radial --kept-pole-order 14 --precision 256", 256),

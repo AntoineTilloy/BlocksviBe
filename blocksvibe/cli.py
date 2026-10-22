@@ -9,7 +9,7 @@
                                               share one setup run and one GPU recursion operator, and their
                                               right-hand sides (q4, lambda order) run as one batch
 
-Supported on the GPU: coordinates xt and/or xt_radial, kept_pole_order >= order (no pole shifting).
+Supported on the GPU: coordinates xt and/or xt_radial, with or without pole shifting (kept_pole_order).
 Anything else (or no GPU, or no b3d_setup helper, or a GPU failure) runs the official blocks_3d instead:
 $BLOCKSVIBE_FALLBACK (path to the binary or a wrapper script) with $BLOCKSVIBE_JEMALLOC preloaded if set
 (the official images are musl builds: 20-40x slower without it).
@@ -180,14 +180,12 @@ class Task:
     def unsupported(self):
         if not self.coordinates <= GPU_COORDS:
             return f"coordinates {sorted(self.coordinates - GPU_COORDS)} (GPU: xt, xt_radial)"
-        if self.kept_pole_order < self.order:
-            return "pole shifting (kept_pole_order < order)"
         return None
 
     def group_key(self):
         """tasks sharing the recursion operator and the M matrices"""
         return (tuple(self.two_js), self.two_j12, self.two_j43, self.delta_12, self.delta_43, self.order,
-                self.Lambda, self.tjmax, self.precision)
+                self.Lambda, self.tjmax, self.precision, min(self.kept_pole_order, self.order))
 
     def lambda_orders(self):
         return [self.p0] if self.radial else list(range(self.p0, self.Lambda + 1, 2))
@@ -387,7 +385,7 @@ def _gpu(tasks, q4s, sfile, timers):
         t1 = time.time()
         plan = RG.Plan(T.two_j12, T.two_j43, T.tjmax, T.order, pp, reuse=True)
         rec = RG.Recursion(plan, M, L)
-        der = DV.Derivs(plan, T.Lambda - p0, L, two_js=tjs)
+        der = DV.Derivs(plan, T.Lambda - p0, L, two_js=tjs, kept_pole_order=T.kept_pole_order)
         outs = {(c, d): cached_output(c, T.Lambda, p0, d, L) for c in coords for d in d12s}
         torch.cuda.synchronize()
         t2 = time.time()
