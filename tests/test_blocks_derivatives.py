@@ -85,6 +85,7 @@ def test(tj12=4, tj43=2, tjmax=6, order=7, R=3, L=10, B=2, seed=1):
     plans = [RG.Plan(tj12, tj43, tjmax, order, pp, reuse=r) for r in (False, True)]
     recs = [RG.Recursion(pl, None, L) for pl in plans]
     recs[1].Mtab = recs[0].Mtab                                       # same random operator
+    recs[1]._constants()                                              # (rebuilds the pole-step tables)
     Sm = plans[0].Smax
     import torch
     torch.manual_seed(seed)

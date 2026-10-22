@@ -37,12 +37,45 @@ from .. import mpf
 from ..rns import dev
 
 
+def _pad(A, dims):
+    """zero-pad the last two entry dimensions of A to (dims[0], dims[1])"""
+    r, c = A.shape[-2], A.shape[-1]
+    if (r, c) == tuple(dims):
+        return A
+    m = torch.nn.functional.pad(A.m, (0, dims[1] - c, 0, dims[0] - r))
+    e = torch.nn.functional.pad(A.e, (0, dims[1] - c, 0, dims[0] - r), value=mpf.EZ)
+    return mpf.MPF(m, e)
+
+
+_NOPAD = __import__("os").environ.get("SDPVIBE_BLOCKS_NOPAD") == "1"      # A/B timing of the padding only
+
+
+def gemm(A, B, q=32):
+    """mpf.gemm (2-d or batched); for K >= 64, K (and M, N when >= 64) zero-padded to multiples of q: the
+    RNS kernel cannot vectorise its int8 loads when K is not a multiple of 16 and pays partial tiles in M, N
+    (3x at K = 154).  Small products are left alone: there the padding costs more conversions than it saves."""
+    M, K = A.shape[-2:]
+    N = B.shape[-1]
+    if _NOPAD:
+        return mpf.gemm(A, B)
+    if K < 64:
+        return mpf.gemm(A, B)
+    up = lambda x: -(-x // q) * q if x >= 64 else x
+    Mp, Kp, Np = up(M), up(K), up(N)
+    if (Mp, Kp, Np) == (M, K, N):
+        return mpf.gemm(A, B)
+    C = mpf.gemm(_pad(A, (Mp, Kp)), _pad(B, (Kp, Np)))
+    if (Mp, Np) == (M, N):
+        return C
+    return mpf.MPF(C.m[..., :M, :N].contiguous(), C.e[..., :M, :N].contiguous())
+
+
 def bgemm(A, B, chunk=384):
-    """batched mpf.gemm, chunked over the batch (the RNS kernel's grid z = primes x batch < 2^16)"""
+    """batched (aligned) mpf.gemm, chunked over the batch (the RNS kernel's grid z = primes x batch < 2^16)"""
     nb = A.shape[0]
     if nb <= chunk:
-        return mpf.gemm(A, B)
-    parts = [mpf.gemm(A[i:i + chunk], B[i:i + chunk]) for i in range(0, nb, chunk)]
+        return gemm(A, B)
+    parts = [gemm(A[i:i + chunk], B[i:i + chunk]) for i in range(0, nb, chunk)]
     return mpf.MPF(torch.cat([q.m for q in parts], 1), torch.cat([q.e for q in parts], 0))
 
 
@@ -245,6 +278,17 @@ class Plan:
             lev["t_R"] = torch.from_numpy(idx[2 * o + 1:2 * (o + n):2].copy())
             lev["t_q"] = torch.from_numpy(qidx[o:o + n].copy())
             o += n
+        # distinct (L matrix, Q value) pairs: the pole step multiplies by the product q L, tabulated once
+        pair = np.concatenate([idx[0::2] * len(self.Qkeys) + qidx])
+        pidx, self.LQpairs = _first_rank(pair)
+        self.LQpairs = np.stack([self.LQpairs // len(self.Qkeys), self.LQpairs % len(self.Qkeys)], 1)
+        o = 0
+        for x in raw:
+            if x is None:
+                continue
+            n = len(x[1][0])
+            x[0]["t_qL"] = torch.from_numpy(pidx[o:o + n].copy())
+            o += n
 
     def _physical(self, reuse):
         """logical -> physical slots (self.phys: -1 for unborn slots, which are zero and read as the zero
@@ -337,13 +381,14 @@ class Recursion:
     M: dict as in dump.read_M (strings) -- matrices for every key of plan.Mkeys; or None for
     random O(1) matrices (timing runs: the cost does not depend on the values)."""
 
-    def __init__(self, plan, M, L, pole="cuda", cauchy="auto", task_chunk=8192, kcut=128):
+    def __init__(self, plan, M, L, pole="cuda", cauchy="auto", task_chunk=8192, kcut=128, ncut=128):
         """pole: "cuda" (two batched S x S GEMMs on CUDA cores, blocks/smallgemm.py) | "gemm" (batched
         q L(x)R RNS GEMM) | "elementwise"; cauchy: "cuda" (CUDA-core kernel using that
         the coefficients are 2/integer, blocks/cauchy.py; cost ~ K) | "rns" (batched RNS GEMM; cost ~
-        CRT per entry) | "auto" (cuda for levels with <= kcut prime poles, rns above)"""
+        CRT per entry) | "auto" (cuda for levels with <= kcut prime poles or <= ncut columns S^2 B, rns above:
+        at B = 1 the CUDA-core kernel wins at every level)"""
         self.plan, self.L, self.pole, self.cauchy, self.task_chunk = plan, L, pole, cauchy, task_chunk
-        self.kcut = kcut
+        self.kcut, self.ncut = kcut, ncut
         Sm = plan.Smax
         mp.mp.prec = 32 * L + 64
         nM = len(plan.Mkeys)
@@ -375,6 +420,12 @@ class Recursion:
         self.Ctab = mpf.from_mp(tab, L, (len(tab),))
         self.levels = [None if lev is None else {k: (v.to(dev) if torch.is_tensor(v) else v)
                                                  for k, v in lev.items()} for lev in plan.levels]
+        # pole-step operands, aligned per row once: R matrices, and q L for every (L, Q) pair of the plan
+        self.Ralign = mpf._align_rows(self.Mtab)
+        pr = torch.from_numpy(plan.LQpairs).to(dev)
+        Sm = plan.Smax
+        QL = mpf.mul(_take(self.Mtab, pr[:, 0]), _expand(_take(self.Qtab, pr[:, 1])[:, None, None], (len(pr), Sm, Sm)))
+        self.QLalign = mpf._align_rows(QL)
 
     def run(self, h_inf, timer=None, prof=None, hook=None):
         """h_inf: MPF (2, >= order, Jh, Smax^2, B).  Returns residues MPF (nphys + 1, Smax^2, B) (physical
@@ -394,7 +445,7 @@ class Recursion:
             if m > 0:
                 X = _take(res, lev["col"]).reshape(nb, Kc, S2 * B)
                 cdiff, cidx = cauchy_tables(lev)
-                if self.cauchy == "cuda" or (self.cauchy == "auto" and Kc <= self.kcut):
+                if self.cauchy == "cuda" or (self.cauchy == "auto" and (Kc <= self.kcut or S2 * B <= self.ncut)):
                     H = mpf.add(cauchy_kernel(X, cdiff), Hi)
                 else:
                     C = _take(self.Ctab, cidx)                                        # (nb, Mr, Kc)
@@ -408,7 +459,7 @@ class Recursion:
             Ht = _take(H.reshape(nb * Mr, S2, B), lev["t_hrow"])                     # (T, a b, B)
             for t0 in range(0, T, self.task_chunk):
                 sl = slice(t0, min(T, t0 + self.task_chunk))
-                out = self._pole(Ht[sl], lev["t_L"][sl], lev["t_R"][sl], lev["t_q"][sl])
+                out = self._pole(Ht[sl], lev["t_L"][sl], lev["t_R"][sl], lev["t_q"][sl], lev["t_qL"][sl])
                 res.m[:, lev["t_slot"][sl]] = out.m
                 res.e[lev["t_slot"][sl]] = out.e
             if prof is not None:
@@ -421,18 +472,17 @@ class Recursion:
                 timer(m)
         return res
 
-    def _pole(self, Ht, iL, iR, iq):
+    def _pole(self, Ht, iL, iR, iq, iqL=None):
         """out[t, a0 b0, :] = q_t sum_{a,b} L_t[a0,a] R_t[b0,b] Ht[t, a b, :]"""
         Sm, B = self.plan.Smax, Ht.shape[-1]
         T, S2 = Ht.shape[0], Sm * Sm
-        Lt, Rt = _take(self.Mtab, iL), _take(self.Mtab, iR)                       # (T, a0, a), (T, b0, b)
-        if self.pole == "cuda":           # two batched S x S GEMMs on CUDA cores: (q L) (R H^T)^T
+        if self.pole == "cuda":           # two batched S x S GEMMs on CUDA cores: (q L) (R H^T)^T, pre-aligned tables
             H4 = Ht.reshape(T, Sm, Sm, B)                                          # (t, a, b, k)
             Hb = _permute(H4, (0, 2, 1, 3)).reshape(T, Sm, Sm * B)                 # (t, b, a k)
-            Y = smallgemm(Rt, Hb).reshape(T, Sm, Sm, B)                            # (t, b0, a, k)
+            Y = smallgemm(None, Hb, aligned=(self.Ralign[0][:, iR], self.Ralign[1][iR])).reshape(T, Sm, Sm, B)
             Y = _permute(Y, (0, 2, 1, 3)).reshape(T, Sm, Sm * B)                   # (t, a, b0 k)
-            qL = mpf.mul(Lt, _expand(_take(self.Qtab, iq)[:, None, None], (T, Sm, Sm)))
-            return smallgemm(qL, Y).reshape(T, S2, B)
+            return smallgemm(None, Y, aligned=(self.QLalign[0][:, iqL], self.QLalign[1][iqL])).reshape(T, S2, B)
+        Lt, Rt = _take(self.Mtab, iL), _take(self.Mtab, iR)                       # (T, a0, a), (T, b0, b)
         if self.pole == "gemm":           # batched (S^2 x S^2) GEMM with K = q (L (x) R), built on the GPU
             shK = (T, Sm, Sm, Sm, Sm)                                              # (a0, b0, a, b)
             K = mpf.mul(_expand(Lt[:, :, None, :, None], shK), _expand(Rt[:, None, :, None, :], shK))

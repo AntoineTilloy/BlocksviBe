@@ -27,7 +27,7 @@ import numpy as np
 import torch
 
 from . import structure as S
-from .recursion_gpu import _permute, _take
+from .recursion_gpu import gemm as RG_gemm, _permute, _take
 from .. import mpf
 from ..rns import dev
 
@@ -186,7 +186,7 @@ class Output:
         X = _permute(num.reshape(Jo, Dout, R1, 2, S2, nq, nL), (2, 6, 0, 3, 4, 5, 1))        # (e, idx, jo, p, s, q, d)
         uidx = torch.tensor([e * nL + i for i, e in self.inputs], device=dev)
         X = _take(X.reshape(R1 * nL, -1), uidx)                                              # (inputs, cols)
-        out = mpf.gemm(self.W, X).reshape(len(self.outputs), Jo, 2, S2, nq, Dout)
+        out = RG_gemm(self.W, X).reshape(len(self.outputs), Jo, 2, S2, nq, Dout)
         return _permute(out, (1, 2, 3, 4, 0, 5))
 
 
@@ -208,7 +208,7 @@ def apply_per_order(out, nums):
         rows.append(_take(X.reshape(R1, -1), torch.tensor(e_needed, device=dev)))
     X = mpf.MPF(torch.cat([r.m for r in rows], 1), torch.cat([r.e for r in rows], 0))
     Jo, _, _, _, S2, nq = nums[0].shape
-    res = mpf.gemm(out.W, X).reshape(len(out.outputs), Jo, 2, S2, nq, Dmax)
+    res = RG_gemm(out.W, X).reshape(len(out.outputs), Jo, 2, S2, nq, Dmax)
     return _permute(res, (1, 2, 3, 4, 0, 5))
 
 

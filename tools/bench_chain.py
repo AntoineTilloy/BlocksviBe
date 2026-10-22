@@ -40,7 +40,7 @@ for rep in range(2):                                   # pass 0: compile the ker
         Tn = dict(T)
         der = ders[n]
         torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats()
-        der.start(1)
+        der.start(1, window=int(os.environ.get("WINDOW", 8)))
         prof = {}
         rec.run(h, prof=prof, hook=der.accumulate)
         if rep:

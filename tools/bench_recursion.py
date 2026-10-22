@@ -8,7 +8,7 @@ from sdpvibe.blocks import recursion_gpu as RG
 tj12, tj43, tjmax, order, L = map(int, sys.argv[1:6])
 Bs = list(map(int, sys.argv[6:]))
 t0 = time.time()
-plan = RG.Plan(tj12, tj43, tjmax, order, ((0, 0), (1, 1)))
+plan = RG.Plan(tj12, tj43, tjmax, order, ((0, 0), (1, 1)), reuse=os.environ.get("REUSE") == "1")
 t1 = time.time()
 opts = dict(cauchy=os.environ.get("CAUCHY", "auto"), pole=os.environ.get("POLE", "cuda"),
             task_chunk=int(os.environ.get("CHUNK", 8192)))

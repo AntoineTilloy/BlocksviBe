@@ -3,6 +3,7 @@ residues / r^Delta / Delta -> x / numerators, sdpvibe/blocks/derivatives.py) on 
 shape of a real task (random M and h_inf: the cost does not depend on the values), recycled slot buffer.
 Default: no recursion, the moments are taken level by level from a compact random slot buffer (fits a
 6 GB laptop GPU at order 60); OFFLOAD=1 moves the moments to the host before the final GEMMs; RECURSION=1 runs the real recursion with the moments as its hook.
+SPINS=k: only the k largest output spins (the most poles) -- per-spin costs of large shapes on a small GPU.
    python tools/blocks/bench_derivs.py two_j12 two_j43 j_max order R L B [spin chunks to try ...]"""
 import os, sys, time
 import torch
@@ -15,7 +16,8 @@ plan = RG.Plan(tj12, tj43, 2 * jmax, order, ((0, 0), (1, 1)), reuse=True)
 t1 = time.time()
 full = os.environ.get("RECURSION") == "1"
 rec = RG.Recursion(plan, None, L) if full else None
-der = DV.Derivs(plan, R, L)
+nsp = int(os.environ.get("SPINS", "0"))
+der = DV.Derivs(plan, R, L, two_js=list(range(2 * jmax - 2 * (nsp - 1), 2 * jmax + 1, 2)) if nsp else None)
 t2 = time.time()
 Sm = plan.Smax
 print(f"plan {t1 - t0:.1f} s (physical slots {plan.nphys} of {2 * plan.nslots}), constants {t2 - t1:.1f} s; "
@@ -25,7 +27,7 @@ for chunk in chunks:
     try:
         for rep in range(2):                                 # first pass compiles the kernels
             torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats()
-            der.start(B)
+            der.start(B, window=int(os.environ.get("WINDOW", 8)))
             prof = {"cauchy": 0.0, "pole": 0.0}
             if full:
                 rec.run(h, prof=prof, hook=der.accumulate)

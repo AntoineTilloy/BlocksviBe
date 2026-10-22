@@ -34,12 +34,12 @@ import numpy as np
 import torch
 
 from . import structure as S
-from .recursion_gpu import bgemm, _take, _expand, _permute, _tick
+from .recursion_gpu import gemm as RG_gemm, bgemm, _take, _expand, _permute, _tick
 from .. import mpf
 from ..rns import dev
 
 _SRC = r"""
-// v[row_t, k, col] += n_t^k y[t, col] for k < R1 (y: normalised MPF, n_t < 2^31)
+// v[row_t, col, k] += n_t^k y[t, col] for k < R1 (y: normalised MPF, n_t < 2^31)
 extern "C" __global__ void momacc(const int* Y, const i64* eY, const int* NN, const i64* rows,
                                   int* Mo, i64* eMo, i64 T, i64 N, i64 nrows, int R1) {
     i64 idx = blockIdx.x * (i64)blockDim.x + threadIdx.x; if (idx >= T * N) return;
@@ -51,9 +51,9 @@ extern "C" __global__ void momacc(const int* Y, const i64* eY, const int* NN, co
     if (bitlen(y, L) == 0) return;
     i64 ey = eY[idx];
     u64 n = (u64)NN[t];
-    i64 P = nrows * R1 * N, o0 = rows[t] * R1 * N + col;
+    i64 P = nrows * R1 * N, o0 = (rows[t] * N + col) * R1;      // moments (row, col, k), k innermost
     for (int kk = 0; kk < R1; kk++) {
-        i64 o = o0 + kk * N;
+        i64 o = o0 + kk;
         for (int k = 0; k < L; k++) a[k] = (u32)Mo[k * P + o];
         bool na = a[L - 1] >> 31;
         if (na) negate(a, L);
@@ -89,15 +89,109 @@ extern "C" __global__ void momacc(const int* Y, const i64* eY, const int* NN, co
         }
     }
 }
+
+// r = a + b for sign-magnitude normalised operands (zero: magnitude 0); result normalised (or zero, EZ)
+__device__ void mpadd(const u32* a, bool na, i64 ea, const u32* b, bool nb, i64 eb, u32* r, bool* nr, i64* er) {
+    u32 wa[L + 2], wb[L + 2];
+    bool za = bitlen(a, L) == 0, zb = bitlen(b, L) == 0;
+    if (za && zb) { for (int k = 0; k < L; k++) r[k] = 0; *nr = false; *er = EZ; return; }
+    if (za) ea = EZ;
+    if (zb) eb = EZ;
+    i64 tt = (ea > eb ? ea : eb) - 32;
+    i64 da = ea - tt, db = eb - tt;
+    int sa = da < -(i64)(32 * (L + 3)) ? 32 * (L + 3) : (int)(-da);
+    int sb = db < -(i64)(32 * (L + 3)) ? 32 * (L + 3) : (int)(-db);
+    if (za) { for (int k = 0; k < L + 2; k++) wa[k] = 0; } else shift_mag(a, L, sa, wa, L + 2);
+    if (zb) { for (int k = 0; k < L + 2; k++) wb[k] = 0; } else shift_mag(b, L, sb, wb, L + 2);
+    if (na) negate(wa, L + 2);
+    if (nb) negate(wb, L + 2);
+    u64 c = 0;
+    for (int k = 0; k < L + 2; k++) { u64 v = (u64)wa[k] + wb[k] + c; wa[k] = (u32)v; c = v >> 32; }
+    bool ns = wa[L + 1] >> 31;
+    if (ns) negate(wa, L + 2);
+    int bl = bitlen(wa, L + 2);
+    if (bl == 0) { for (int k = 0; k < L; k++) r[k] = 0; *nr = false; *er = EZ; return; }
+    int s = bl - NB;
+    shift_mag(wa, L + 2, s, r, L);
+    *nr = ns; *er = tt + s;
+}
+
+// windowed moments, one thread per (row, k, col):
+//   v[row, col, k] += sum_w y[w, row, col] * n_w^k,  n_w = m0 + w + srow[row]
+// (y: residues of W consecutive levels already scaled by r_c^n, zero where a row got none; n^k exact
+// integers of KL limbs from the table NK).  The W exact products are aligned to a common exponent (an upper
+// bound of the largest), truncated 32 bits below an (L+1)-limb window, summed exactly in L + 3 limbs and
+// rounded once, then added to v.
+extern "C" __global__ void momflush(const int* Yb, const i64* eYb, const int* srow, const int* NK, const int* NKb,
+                                    int m0, int W, int* Mo, i64* eMo, i64 nrows, i64 N, int R1, i64 nW) {
+    i64 idx = blockIdx.x * (i64)blockDim.x + threadIdx.x; if (idx >= nrows * R1 * N) return;
+    i64 kk = idx % R1, col = (idx / R1) % N, row = idx / (N * R1);     // k innermost: a warp shares its y loads
+    i64 PY = (i64)W * nrows * N, PW = nW * R1;        // limb-plane strides of the staging buffer and of NK
+    i64 E = EZ;
+    for (int w = 0; w < W; w++) {                      // pass 1: exponent bound of the largest product
+        i64 o = (i64)w * nrows * N + row * N + col;
+        if (Yb[(L - 1) * PY + o] == 0) continue;       // normalised: zero iff the top limb is 0
+        i64 t = eYb[o] + NB + NKb[(i64)(m0 + w + srow[row]) * R1 + kk];
+        if (t > E) E = t;
+    }
+    if (E == EZ) return;
+    i64 T = E - 32 * (L + 1);                          // weight of the accumulator's lowest limb
+    u32 acc[L + 3];
+    for (int k = 0; k < L + 3; k++) acc[k] = 0;
+    for (int w = 0; w < W; w++) {
+        i64 o = (i64)w * nrows * N + row * N + col;
+        u32 a[L];
+        for (int k = 0; k < L; k++) a[k] = (u32)Yb[k * PY + o];
+        bool na = a[L - 1] >> 31;
+        if (na) negate(a, L);
+        if (bitlen(a, L) == 0) continue;
+        i64 ow = (i64)(m0 + w + srow[row]) * R1 + kk;
+        i64 sh = T - eYb[o];                            // product limbs >> sh land on acc's grid
+        if (sh >= 32 * (L + KL)) continue;              // entirely below the window
+        u32 p[L + KL];
+        for (int k = 0; k < L + KL; k++) p[k] = 0;
+        for (int x = 0; x < KL; x++) {
+            u32 bx = (u32)NK[x * PW + ow];
+            if (!bx) continue;
+            u64 c = 0;
+            for (int y = 0; y < L; y++) { u64 v = (u64)bx * a[y] + p[x + y] + c; p[x + y] = (u32)v; c = v >> 32; }
+            p[x + L] = (u32)c;
+        }
+        u32 q[L + 2];
+        shift_mag(p, L + KL, (int)sh, q, L + 2);
+        if (na) { u64 bo = 0; for (int k = 0; k < L + 2; k++) { u64 v = (u64)acc[k] - q[k] - bo; acc[k] = (u32)v; bo = (v >> 32) & 1; }
+                  acc[L + 2] -= (u32)bo; }
+        else { u64 c = 0; for (int k = 0; k < L + 2; k++) { u64 v = (u64)acc[k] + q[k] + c; acc[k] = (u32)v; c = v >> 32; }
+               acc[L + 2] += (u32)c; }
+    }
+    bool ns = acc[L + 2] >> 31;
+    if (ns) negate(acc, L + 3);
+    int bl = bitlen(acc, L + 3);
+    if (bl == 0) return;
+    u32 r[L], mo[L], t[L + 1];
+    int s = bl - NB;
+    shift_mag(acc, L + 3, s, r, L);
+    i64 o = (row * N + col) * R1 + kk, P = nrows * R1 * N;
+    for (int k = 0; k < L; k++) mo[k] = (u32)Mo[k * P + o];
+    bool nm = mo[L - 1] >> 31;
+    if (nm) negate(mo, L);
+    bool nr; i64 er;
+    mpadd(mo, nm, eMo[o], r, ns, T + s, t, &nr, &er);
+    if (nr) negate(t, L);
+    for (int k = 0; k < L; k++) Mo[k * P + o] = (int)t[k];
+    eMo[o] = er;
+}
 """
 _mods = {}
 
 
-def _kernel(L):
-    if L not in _mods:
+def _kernel(L, name="momacc", KL=1):
+    key = (L, KL)
+    if key not in _mods:
         src = (mpf._SRC + _SRC).replace("__L__", str(L)).replace("__LMAX__", str(mpf.LMAX_WIDE))
-        _mods[L] = cp.RawModule(code=src, options=("-std=c++17",)).get_function("momacc")
-    return _mods[L]
+        src = src.replace("#define NB (32 * L - 2)", f"#define NB (32 * L - 2)\n#define KL {KL}")
+        _mods[key] = cp.RawModule(code=src, options=("-std=c++17",))
+    return _mods[key].get_function(name)
 
 
 def _cat(parts, dim):
@@ -273,21 +367,64 @@ class Derivs:
         d._small_constants()
         return d
 
-    def start(self, B):
-        """zero moment accumulators for a batch of B right-hand sides"""
+    def start(self, B, window=8):
+        """zero moment accumulators for a batch of B right-hand sides.  window: levels staged before the
+        moments are updated (momflush: accumulator traffic / window); 1 = per-level kernel (momacc)"""
         self.N = self.plan.Smax ** 2 * B
         self.B = B
-        self.mom = mpf.zeros((2 * self.Jo * self.NP, self.R + 1, self.N), self.L)
+        nrows = 2 * self.Jo * self.NP
+        self.mom = mpf.zeros((nrows, self.N, self.R + 1), self.L)           # (row, col, k)
+        self.W = window
+        if window > 1:
+            self.stage = torch.zeros((self.L, window, nrows, self.N), dtype=torch.int32, device=dev)
+            self.stage_e = torch.zeros((window, nrows, self.N), dtype=torch.int64, device=dev)
+            if not hasattr(self, "srow"):
+                srow = np.zeros((2, self.Jo, self.NP), dtype=np.int32)
+                for jo, pl in enumerate(self.poles):
+                    srow[:, jo, :len(pl)] = [S.shift(P) for P in pl]
+                self.srow = torch.from_numpy(srow.reshape(-1)).to(dev)
+            self.m0, self.pending = 0, False
+            if getattr(self, "NKR", None) != self.R:      # exact n^k (limb planes) and bit lengths
+                order, R1 = self.plan.order, self.R + 1
+                KL = max(1, ((order ** self.R).bit_length() + 31) // 32)
+                v = [n ** k for n in range(order + 1) for k in range(R1)]
+                self.NK = torch.from_numpy(np.array([[(x >> (32 * l)) & 0xFFFFFFFF for x in v] for l in range(KL)],
+                                                    dtype=np.uint32).view(np.int32)).to(dev)
+                self.NKb = torch.tensor([x.bit_length() for x in v], dtype=torch.int32, device=dev)
+                self.NKR = self.R
+
+    def _flush(self):
+        nrows, R1 = self.mom.shape[0], self.R + 1
+        th = 128
+        tot = nrows * R1 * self.N
+        _kernel(self.L, "momflush", self.NK.shape[0])(((tot + th - 1) // th,), (th,),
+            (cp.from_dlpack(self.stage), cp.from_dlpack(self.stage_e), cp.from_dlpack(self.srow),
+             cp.from_dlpack(self.NK), cp.from_dlpack(self.NKb), np.int32(self.m0), np.int32(self.W),
+             cp.from_dlpack(self.mom.m), cp.from_dlpack(self.mom.e), np.int64(nrows), np.int64(self.N),
+             np.int32(R1), np.int64(self.plan.order + 1)))
+        self.stage.zero_()
+        self.pending = False
 
     def accumulate(self, m, res):
         """recursion hook: add level m's residues of output spins to the moments"""
         lev = self.levels[m]
+        if self.W > 1 and self.pending and m - self.m0 >= self.W:
+            self._flush()
         if lev is None:
             return
         sl, rw, nn = lev
         T = sl.numel()
         X = _take(res, sl).reshape(T, self.N)
         Y = mpf.mul(X, _expand(_take(self.rcpow, nn.long())[:, None], (T, self.N)))
+        if self.W > 1:                                   # stage; the flush multiplies by n^k
+            if not self.pending:
+                self.m0, self.pending = m, True
+            w = m - self.m0
+            self.stage[:, w, rw] = Y.m
+            self.stage_e[w, rw] = Y.e
+            if w == self.W - 1:
+                self._flush()
+            return
         th = 128
         _kernel(self.L)(((T * self.N + th - 1) // th,), (th,),
                         (cp.from_dlpack(Y.m.contiguous()), cp.from_dlpack(Y.e.contiguous()), cp.from_dlpack(nn),
@@ -297,6 +434,9 @@ class Derivs:
     def offload(self):
         """move the finished moments to pinned host memory (finish_iter streams them back per spin chunk):
         frees GPU memory for the final GEMMs on small cards"""
+        if getattr(self, "W", 1) > 1 and self.pending:
+            self._flush()
+        self.stage = self.stage_e = None
         self.mom = mpf.MPF(self.mom.m.cpu().pin_memory(), self.mom.e.cpu().pin_memory())
 
     def finish(self, h_inf, chunk=None):
@@ -308,6 +448,8 @@ class Derivs:
         """as finish, by chunks of output spins (bounded temporaries): yields (first spin index, numerators).
         prof: dict accumulating GPU seconds per stage"""
         tick = (lambda k: _tick(prof, k)) if prof is not None else (lambda k: None)
+        if getattr(self, "W", 1) > 1 and self.pending:
+            self._flush()
         tick(None)
         R, Jo, NP, order = self.R, self.Jo, self.NP, self.plan.order
         N, Rw = self.N, max(R, 1)
@@ -316,10 +458,10 @@ class Derivs:
         jidx = torch.tensor([(tj - self.plan.tj12 % 2) // 2 for tj in self.tjs], device=dev)
         H = mpf.MPF(h_inf.m[:, :, :order + 1][:, :, :, jidx], h_inf.e[:, :order + 1][:, :, jidx])  # (2, o+1, Jo, S2, B)
         H = _permute(H, (1, 2, 0, 3, 4)).reshape(order + 1, Jo * Nc)
-        c = mpf.gemm(self.Wh, H).reshape(R + 1, Jo, Nc)                                  # c[d]
+        c = RG_gemm(self.Wh, H).reshape(R + 1, Jo, Nc)                                  # c[d]
         c = _permute(c, (1, 0, 2))                                                       # (Jo, R+1, Nc)
         tick("h_inf part")
-        mom = self.mom.reshape(2, Jo, NP, R + 1, N)
+        mom = self.mom.reshape(2, Jo, NP, N, R + 1)
         chunk = chunk or Jo
         for j0 in range(0, Jo, chunk):
             j1 = min(Jo, j0 + chunk)
@@ -327,7 +469,7 @@ class Derivs:
             v = mom[:, j0:j1]
             if v.m.device != dev:
                 v = mpf.MPF(v.m.to(dev), v.e.to(dev))
-            v = _permute(v, (1, 2, 3, 0, 4)).reshape(J, NP, R + 1, Nc)                   # v_i[d]
+            v = _permute(v, (1, 2, 4, 0, 3)).reshape(J, NP, R + 1, Nc)                   # v_i[d]
             tick("moments in")
             T = _take(self.Ttab, self.didx[j0:j1].reshape(-1))                        # (J NP, e, d): C(e,d) D_i^(e-d)
             a = bgemm(T, v.reshape(J * NP, R + 1, Nc)).reshape(J, NP, R + 1, Nc)         # a_i[e]
@@ -343,7 +485,7 @@ class Derivs:
             del G
             Gs = _permute(_take(_permute(Gz, (1, 0, 2)), self.gidx).reshape(R + 1, R + 1, J, Nc), (1, 2, 0, 3))
             del Gz                                                                       # G'[s][d] as (d, jo, s, col)
-            Hm = mpf.gemm(self.Cb, Gs.reshape(R + 1, -1)).reshape(R + 1, J, R + 1, Nc)  # H[e][s] (e, jo, s, col)
+            Hm = RG_gemm(self.Cb, Gs.reshape(R + 1, -1)).reshape(R + 1, J, R + 1, Nc)  # H[e][s] (e, jo, s, col)
             del Gs
             Hm = _cat([_permute(Hm, (0, 2, 1, 3)).reshape((R + 1) ** 2, J, Nc), mpf.zeros((1, J, Nc), self.L)], 0)
             cz = _cat([_permute(c[j0:j1], (1, 0, 2)), mpf.zeros((1, J, Nc), self.L)], 0)  # (d | zero, jo, col)

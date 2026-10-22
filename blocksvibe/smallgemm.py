@@ -64,12 +64,18 @@ def _kernel(L):
     return _mods[L]
 
 
-def smallgemm(A, B):
-    """A: MPF (T, M, K), B: MPF (T, K, N) -> MPF (T, M, N)"""
-    T, M, K = A.shape
+def smallgemm(A, B, aligned=None):
+    """A: MPF (T, M, K), B: MPF (T, K, N) -> MPF (T, M, N).  aligned: (limbs (L, T, M, K), row exponents
+    (T, M)) of A already aligned per row (e.g. gathered from a pre-aligned table of constant matrices);
+    A is then only used for its shape (pass None for A and give shape via aligned)."""
+    if aligned is not None:
+        Am, rA = aligned
+        L, T, M, K = Am.shape
+    else:
+        T, M, K = A.shape
+        L = A.L
+        Am, rA = mpf._align_rows(A)                                # (L, T, M, K), (T, M)
     N = B.shape[2]
-    L = A.L
-    Am, rA = mpf._align_rows(A)                                    # (L, T, M, K), (T, M)
     Bm, cB = mpf._align_rows(B.T)                                  # (L, T, N, K), (T, N)
     Bm = Bm.permute(0, 1, 3, 2).contiguous()                       # (L, T, K, N)
     tot = T * M * N
