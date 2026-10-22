@@ -450,6 +450,7 @@ class Derivs:
         tick = (lambda k: _tick(prof, k)) if prof is not None else (lambda k: None)
         if getattr(self, "W", 1) > 1 and self.pending:
             self._flush()
+        self.stage = self.stage_e = None                  # staging is done: free it (start() reallocates)
         tick(None)
         R, Jo, NP, order = self.R, self.Jo, self.NP, self.plan.order
         N, Rw = self.N, max(R, 1)
