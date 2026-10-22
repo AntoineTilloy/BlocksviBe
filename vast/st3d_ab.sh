@@ -82,13 +82,31 @@ stop_hyperion() {
 run_point() {   # label
     local L=$1
     local before=$(ls /root/hyp/data/*/ 2>/dev/null | sort)
-    local t0=$(date +%s) id="" ok=0
+    local t0=$(date +%s) id="" ok=0 logs="" last=$(date +%s) n n_prev=""
     ( cd $ST && setsid nohup $EXE master -p $PROG > ~/BlocksviBe/results/${L}_master.out 2>&1 < /dev/null & )
     while true; do
         sleep 20
-        [ -n "$id" ] || id=$(comm -13 <(echo "$before") <(ls /root/hyp/data/*/ 2>/dev/null | sort) | grep -v '^$' | head -1)
-        [ -n "$id" ] && grep -q "Finished computing SDP Part" -r /root/hyp/logs/*/$id 2>/dev/null && { ok=1; break; }
+        if [ -z "$id" ]; then
+            id=$(comm -13 <(echo "$before") <(ls /root/hyp/data/*/ 2>/dev/null | sort) | grep -v '^$' | head -1)
+            logs=$id
+        fi
+        # "SDP Part's", not "SDP Part": "Finished computing SDP PartChunk's" comes before the PMP is written
+        [ -n "$id" ] && grep -qs "Finished computing SDP Part's" -r $(for g in $logs; do echo /root/hyp/logs/*/$g; done) && { ok=1; break; }
         pgrep -f stress-tensors-3d-exec > /dev/null || break
+        # hyperion can lose a worker (deployed, connected, never reports) and then waits forever: after
+        # STALL_MIN quiet minutes, restart the master from the run's database (finished tasks are memoized;
+        # it writes into the same data directory)
+        n=$(cat $(for g in $logs; do echo /root/hyp/logs/*/$g/*.log; done) 2>/dev/null | wc -c)
+        [ "$n" != "$n_prev" ] && { n_prev=$n; last=$(date +%s); }
+        if [ -n "$id" ] && [ $(( $(date +%s) - last )) -gt $(( ${STALL_MIN:-15} * 60 )) ]; then
+            stop_hyperion
+            log "$L: hyperion idle for ${STALL_MIN:-15} min (lost worker?): master restarted from its database"
+            ( cd $ST && setsid nohup $EXE master -p $PROG -d $(ls /root/hyp/databases/*/$id.sqlite | head -1) \
+                >> ~/BlocksviBe/results/${L}_master.out 2>&1 < /dev/null & )
+            sleep 10
+            logs="$logs $(grep -o 'Logging to: "[^"]*' ~/BlocksviBe/results/${L}_master.out | tail -1 | sed 's#.*/##; s#\.log$##')"
+            last=$(date +%s)
+        fi
     done
     local t1=$(date +%s)
     stop_hyperion

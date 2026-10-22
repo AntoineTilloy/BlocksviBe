@@ -586,7 +586,7 @@ Raw logs: results/vast_st3d_ab/ (not in the repository).
 |---|---|---|---|
 | A | 644 (550 TTTT + 94 per point: TTTe, TTss/TTee, sigma families with Delta_12, Delta_43 != 0) | official blocks_3d + jemalloc, 64 cores | 63.5 min (block tables over 49 min) |
 | B | 94 per point (hyperion reused A's TTTT results from its central store) | BlocksviBe on the 3090 | 13.5 min |
-| B2 | all 644 (central TTTT store moved aside) | BlocksviBe on the 3090 | not finished (below) |
+| B2 | all 644 (central TTTT store moved aside) | BlocksviBe on the 3090 | not finished (below); done on a second box, next subsection |
 
 * **PMP A vs B** (`tools/compare_pmp.py`): 115 PMP files, 3,174,680 numbers, max relative error
   **2^-758.1** per vector at 768-bit blocks, no structural difference.  B: 94 drop-in calls in 27 spool
@@ -607,3 +607,46 @@ Raw logs: results/vast_st3d_ab/ (not in the repository).
   `compare_json.py` reports the error relative to each spin's table as well.
 * Pipeline issues found on the way (fixed in SDPviBe's `vast/st3d_setup.sh`): hyperion's pmp2sdp call
   failed under fake Slurm (OpenMPI needs SLURM_TASKS_PER_NODE) and with `-n $(nproc)` = hardware threads.
+
+### All 644 blocks_3d tasks on the GPU (2026-10-22, second box)
+
+Same program and pipeline, `vast/st3d_ab.sh` with one BLAS thread per drop-in process, on a second box
+(2x EPYC 7452, 64 cores / 128 threads under a 61.4-CPU cgroup quota, 160 GB, one RTX 3090; 4.8 h, ~$2.3).
+A and B both computed every task from scratch (the central TTTT store was moved aside before B).
+Raw logs: results/vast_st3d_allgpu/ (not in the repository).
+
+| phase (hyperion's log) | A: official blocks_3d + jemalloc | B: BlocksviBe on the 3090 |
+|---|---|---|
+| 550 TTTT tasks | 49.0 min | 25.8 min |
+| 94 per-point tasks (75 + 19) | 7.6 min | 4.6 min |
+| all blocks | **56.6 min** | **30.5 min (1.86x)** |
+| composite blocks (1870 + 1414) | 7.2 min | 15.7 min |
+| PartChunks (2501) + Parts (115) | 1.5 min + 22 s | 2.0 min + 23 s |
+| master start to PMP | **66.0 min** | **48.8 min (1.35x)**, without the stall below |
+
+* **B**: 644 drop-in calls in 113 spool batches (sizes 1-22), **0 fallbacks, 0 GPU failures**; peak 9.5k
+  of the cgroup's 15.6k pids (the B2 thread exhaustion is gone).  GPU busy ~58% of the block phase
+  (240 s constants + 803 s Recursion chains over 30.5 min, matching the 30 s nvidia-smi samples): the
+  rest is b3d_setup on the CPU (h_inf, and M for the 52 of 113 batches not in the disk cache: 4582 s
+  summed over batches, overlapped), which now gates the GPU at nmax=6: a GPU h_inf (section 9, setup
+  bullet) is worth doing.  The composites ran 2.2x slower in B than in A with tables of the same size or
+  smaller (not explained; possibly the 30 GB of tables written in a 30 min burst instead of 57 min).
+* **TTTT and per-point tables** (13 sampled, `compare_json.py`, 768 bits): 8 agree to **2^-764.7 ..
+  2^-767.2 relative to each spin's table** (33,054 / 33,054 / 18,354 / 7,644 / 4,068 / 2,184 / 1,572 /
+  516 polynomials; TTTT and per point, j12 != j43 included); 3 are exact zeros in both runs; 2 vanish by a selection rule and are rounding
+  noise in both (`FP3O6Qr`, as in B2; `V_PEUw8`, xt_radial q4 = (0,2,0,2), j12 = 1, j43 = 2: entries
+  1e-218 .. 1e-175 where the same table at q4 = (-1,0,0,1) reaches 1e34 .. 4e77, i.e. 2^-837 of its scale).
+* **PMP A vs B** (`compare_pmp.py`): 115 files, 3,174,680 numbers, max relative error **2^-757.2** per
+  vector, no structural difference.
+* **Solve** (SDPviBe on the 3090, 1024 bits): A and B both "found primal feasible solution" in 115
+  iterations (19.5 min / 20.8 min); `compare_iterations.py` A vs B: identical at the printed digits.
+  Official SDPB not run (~2 h at 64 cores for this size, past the box deadline); its verdict on this
+  program and point (2026-10-13) is the same.
+* **Incidents**: (i) hyperion lost a worker: the last of 2501 PartChunks was deployed, connected to the
+  master, never reported, and the master waited 95 min.  Restarting the master with `-d <its sqlite>`
+  recomputed only that chunk (0.2 s) and the Parts, into the same data directory.  `st3d_ab.sh` now does
+  this by itself after STALL_MIN (15) quiet minutes.  (ii) The script's end-of-run test grepped
+  "Finished computing SDP Part", which also matches "...SDP PartChunk's": it stopped A during its Part
+  step, before the PMP JSON was written (A's PMP was completed the same way, 112 Parts in 21.5 s, no block
+  task).  It now waits for "SDP Part's".
+
