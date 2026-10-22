@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "blocks_3d's conformal-block computation on GPUs (batched multiprecision recursion), blocks_3d-compatible output"
 requires-python = ">=3.10"
 # multiprecision GPU arithmetic (mpf, rns) from SDPviBe; cupy must match the CUDA version
-dependencies = ["sdpvibe", "torch", "numpy", "mpmath"]
+dependencies = ["sdpvibe", "torch", "numpy", "mpmath", "gmpy2"]
 
 [project.scripts]
 blocksvibe = "blocksvibe.cli:main"

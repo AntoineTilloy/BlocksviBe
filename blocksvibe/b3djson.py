@@ -7,7 +7,9 @@ the limb-rounded precision (general format: p significant digits, trailing zeros
 for decimal exponents -4 <= e < p, else d.ddde+XX); header doubles use C++'s %.{p}g.
 """
 import math
+import gmpy2
 import mpmath as mp
+import numpy as np
 from mpmath import libmp
 
 from . import structure as S
@@ -51,6 +53,32 @@ def fmt_big(x, p):
     else:
         s = "0." + "0" * (-1 - e) + digs
     return ("-" if sign else "") + s
+
+
+def fmt_gmpy(x, p):
+    """fmt_big for a gmpy2 mpfr (MPFR's correctly rounded %.{p}g = boost's general format, minus '.0')"""
+    s = format(x, f".{p}g")
+    if "e" in s:
+        m, ex = s.split("e")
+        if m.endswith(".0"):
+            m = m[:-2]
+        return m + "e" + ex
+    return s[:-2] if s.endswith(".0") else s
+
+
+def limbs_to_mpfr(m, e, prec):
+    """MPF host arrays (m: (L, n) int32 limbs, two's complement; e: (n,) exponents) -> list of mpfr"""
+    from sdpvibe.mpf import EZ
+    L, n = m.shape
+    raw = np.ascontiguousarray(m.T).view(np.uint8).reshape(n, 4 * L)
+    ctx = gmpy2.get_context()
+    ctx.precision = prec
+    out = []
+    fb, mul2 = int.from_bytes, gmpy2.mul_2exp
+    for i in range(n):
+        v = fb(raw[i].tobytes(), "little", signed=True)
+        out.append(gmpy2.mpfr(0) if v == 0 or e[i] == EZ else mul2(gmpy2.mpfr(v), int(e[i])))
+    return out
 
 
 def fmt_double(x, p):
@@ -119,8 +147,10 @@ def header(o, two_j, pp, p):
     return "".join(out)
 
 
-def derivs_text(rows, p, eps):
-    """write_derivs.cxx: rows[deriv_0][deriv_1] = list of mpmath coefficients (one polynomial)"""
+def derivs_text(rows, p, eps, fmt=None):
+    """write_derivs.cxx: rows[deriv_0][deriv_1] = list of coefficients (one polynomial; mpmath or gmpy2
+    numbers, formatted by fmt)"""
+    fmt = fmt or fmt_big
     out = ["          [\n"]
     for d0, row in enumerate(rows):
         out.append("            [\n")
@@ -129,13 +159,13 @@ def derivs_text(rows, p, eps):
             if all(not c for c in poly):
                 out.append("\"0\"")
             else:
-                size, mx = len(poly), mp.mpf(0)          # blocks_3d's truncation of negligible top coefficients
+                size, mx = len(poly), 0                  # blocks_3d's truncation of negligible top coefficients
                 for d in range(len(poly) - 1, -1, -1):
                     c = abs(poly[d])
                     if mx < eps * c:
                         size = d + 1
                     mx = max(mx, c)
-                out.append(",\n".join(f"\"{fmt_big(c, p)}\"" for c in poly[:size]))
+                out.append(",\n".join(f"\"{fmt(c, p)}\"" for c in poly[:size]))
             out.append("\n              ]")
             if d1 + 1 != len(row):
                 out.append(",\n")
@@ -146,11 +176,14 @@ def derivs_text(rows, p, eps):
     return "".join(out)
 
 
-def write_spin(path, o, two_j, pp, structs, coord_rows):
+def write_spin(path, o, two_j, pp, structs, coord_rows, gmp=False):
     """one spin file.  structs[k] = (n_left, n_right); coord_rows[c][k][a][b] = rows for derivs_text
-    (c over the requested coordinates in blocks_3d's order)"""
+    (c over the requested coordinates in blocks_3d's order); gmp: numbers are gmpy2 mpfr (else mpmath)"""
     p = digits10(o.precision)
-    eps = mp.mpf(0.5) * mp.mpf(2) ** -int(0.9 * math.log2(10) * p)
+    if gmp:
+        eps, fmt = gmpy2.mul_2exp(gmpy2.mpfr(1), -1 - int(0.9 * math.log2(10) * p)), fmt_gmpy
+    else:
+        eps, fmt = mp.mpf(0.5) * mp.mpf(2) ** -int(0.9 * math.log2(10) * p), fmt_big
     out = [header(o, two_j, pp, p), "  \"derivs\":\n  [\n"]
     for k in range(2):
         out.append("    [\n")
@@ -159,7 +192,7 @@ def write_spin(path, o, two_j, pp, structs, coord_rows):
             out.append("      [\n")
             for b in range(nr):
                 out.append("        [\n")
-                out.append(",\n".join(derivs_text(c[k][a][b], p, eps) for c in coord_rows))
+                out.append(",\n".join(derivs_text(c[k][a][b], p, eps, fmt) for c in coord_rows))
                 out.append("\n        ]")
                 if b + 1 != nr:
                     out.append(",\n")

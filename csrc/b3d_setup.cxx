@@ -10,6 +10,7 @@
 //   b3d_setup out=<file> precision=<bits> threads=<n> two_js=a,b,c,d two_j12=<k> two_j43=<k>
 //             delta_12=<str> delta_43=<str> order=<k> lambda=<k> two_j_max=<k> radial=<0|1>
 //             q4=a,b,c,d,sign [q4=... ...]           (all spins doubled, i.e. two_j)
+//             [skip_m=1]                             (no M matrices: the caller has them cached)
 //
 // Binary layout (little endian int64 words unless noted), K = limbs per number:
 //   "B3DSETUP" K
@@ -152,6 +153,8 @@ int main(int argc, char *argv[])
 
       // M matrices: depend on q4 only through the four-point parity; one cache for all parities
       M_Matrix m_matrix(delta_12, delta_43);
+      if(kv.count("skip_m") && kv.at("skip_m") == "1")
+        parities.clear();
       for(auto parity : parities)
         m_matrix.initialize(two_j12, two_j43, two_j_max, parity, order, pole_types,
                             clebsch_gordan_cache, factorial);

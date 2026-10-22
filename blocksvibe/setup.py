@@ -25,9 +25,15 @@ def helper_path():
     return None
 
 
+def four_point_parity(two_js, q4):
+    """blocks_3d's four_point_parity (the M matrices depend on q4 only through it)"""
+    return (sum(a - b for a, b in zip(two_js, q4)) // 2) % 2
+
+
 def run_helper(out, two_js, two_j12, two_j43, delta_12, delta_43, order, Lam, two_j_max, radial, q4s,
-               precision, threads):
-    """q4s: list of (q4 (4 two_j-style ints), sign).  Writes the binary setup file `out`."""
+               precision, threads, skip_m=False):
+    """q4s: list of (q4 (4 two_j-style ints), sign).  Writes the binary setup file `out` (without M matrices
+    if skip_m: the caller reads them from a cached file, save_m)."""
     exe = helper_path()
     if exe is None:
         raise FileNotFoundError("b3d_setup not found (build it: make -C csrc, or set BLOCKSVIBE_B3D_SETUP)")
@@ -36,6 +42,8 @@ def run_helper(out, two_js, two_j12, two_j43, delta_12, delta_43, order, Lam, tw
             f"delta_12={delta_12}", f"delta_43={delta_43}", f"order={order}", f"lambda={Lam}",
             f"two_j_max={two_j_max}", f"radial={int(radial)}"]
     args += ["q4=" + ",".join(map(str, q)) + f",{s}" for q, s in q4s]
+    if skip_m:
+        args.append("skip_m=1")
     r = subprocess.run(args, capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(f"b3d_setup failed ({r.returncode}): {r.stderr.strip()[-2000:]}")
@@ -106,8 +114,23 @@ class Task:
         self.q4, self.sign, self.pp, self.h = q4, sign, pp, h
 
 
-def read(path, L):
-    """-> (MTable, [Task]) with numbers on the GPU at L limbs"""
+def save_m(path, cache):
+    """copy the M section of a setup file into `cache` (a setup file with no tasks), atomically"""
+    raw = np.fromfile(path, dtype=np.int64)
+    K = int(raw[1]); nM = int(raw[2])
+    hdr = raw[3:3 + 8 * nM].reshape(nM, 8)
+    end = 3 + 8 * nM + (2 + K) * int((hdr[:, 6] * hdr[:, 7]).sum())
+    tmp = f"{cache}.{os.getpid()}"
+    np.concatenate([raw[:end], np.zeros(1, dtype=np.int64)]).tofile(tmp)
+    os.replace(tmp, cache)
+
+
+def read(path, L, m_path=None):
+    """-> (MTable, [Task]) with numbers on the GPU at L limbs; M from m_path if given (save_m)"""
+    if m_path is not None:
+        M, _ = read(m_path, L)
+        _, tasks = read(path, L)
+        return M, tasks
     raw = np.fromfile(path, dtype=np.int64)
     assert raw[:1].view("S8")[0] == b"B3DSETUP", "not a b3d_setup file"
     K = int(raw[1]); pos = 2

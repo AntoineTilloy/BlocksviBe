@@ -16,8 +16,10 @@ $BLOCKSVIBE_FALLBACK (path to the binary or a wrapper script) with $BLOCKSVIBE_J
 
 Environment: BLOCKSVIBE_B3D_SETUP (helper, default <repo>/build/b3d_setup), BLOCKSVIBE_LIMBS (GPU limbs,
 default ceil((precision + 62) / 32) with the precision rounded up to 64-bit limbs as blocks_3d does),
-BLOCKSVIBE_MAX_RHS (cap on right-hand sides per GPU batch), BLOCKSVIBE_CACHE (write_output maps,
-default ~/.cache/blocksvibe), BLOCKSVIBE_LOCKDIR (GPU lock files, default /tmp), BLOCKSVIBE_VERBOSE=1.
+BLOCKSVIBE_MAX_RHS (cap on right-hand sides per GPU batch), BLOCKSVIBE_CACHE (write_output maps and M
+matrices, default ~/.cache/blocksvibe), BLOCKSVIBE_LOCKDIR (GPU lock files, default /tmp),
+BLOCKSVIBE_SPOOL / _SPOOL_QUIET / _SPOOL_MAX / _SPOOL_OFF=1 (joining concurrent invocations of one group
+into one batch, spool_run), BLOCKSVIBE_VERBOSE=1.
 GPUs: one task (group) at a time per GPU, through a lock file per GPU; the CPU setup stage runs before
 the lock is taken, so concurrent tasks overlap their CPU work with each other's GPU work.
 """
@@ -30,6 +32,8 @@ import subprocess
 import sys
 import tempfile
 import time
+
+import numpy as np
 
 OPTS = {  # blocks_3d option -> (attribute, default); None = required
     "j-external": ("j_external", None), "j-internal": ("j_internal", None), "j-12": ("j12", None),
@@ -272,6 +276,10 @@ def limbs(precision):
     return -(-(rounded + 62) // 32)
 
 
+def cache_dir():
+    return os.environ.get("BLOCKSVIBE_CACHE", os.path.expanduser("~/.cache/blocksvibe"))
+
+
 def cached_output(coord, Lam, p0, d12, L):
     """output.Output with its write_output map cached on disk (mpmath construction: ~2 s at Lambda 19,
     ~1 min at Lambda 43)"""
@@ -279,7 +287,7 @@ def cached_output(coord, Lam, p0, d12, L):
     from . import output as OUT
     from sdpvibe import mpf
     from sdpvibe.rns import dev
-    d = os.environ.get("BLOCKSVIBE_CACHE", os.path.expanduser("~/.cache/blocksvibe"))
+    d = cache_dir()
     key = hashlib.sha1(f"{coord}|{Lam}|{p0}|{d12}|{L}|v1".encode()).hexdigest()[:20]
     path = os.path.join(d, f"wmap_{coord}_L{Lam}_p{p0}_{key}.pt")
     if os.path.exists(path):
@@ -327,13 +335,24 @@ def run_group(tasks, timers):
             seen.add(k); q4s.append(k)
     radial = all(t.radial for t in tasks)
     threads = max(t.num_threads for t in tasks)
+    # M matrices: cached on disk per group and four-point parities (the 22 q4 tasks of a group share them)
+    parities = sorted({SU.four_point_parity(T.two_js, q) for q, _ in q4s})
+    mkey = hashlib.sha1(repr((T.group_key(), parities, "m1")).encode()).hexdigest()[:24]
+    mcache = os.path.join(cache_dir(), f"M_{mkey}.bin")
+    have_m = os.path.exists(mcache)
     with tempfile.TemporaryDirectory(prefix="blocksvibe_") as tmp:
         sfile = os.path.join(tmp, "setup.bin")
         SU.run_helper(sfile, T.two_js, T.two_j12, T.two_j43, T.delta_12, T.delta_43, T.order, T.Lambda,
-                      T.tjmax, radial, q4s, T.precision, threads)
+                      T.tjmax, radial, q4s, T.precision, threads, skip_m=have_m)
+        if not have_m:
+            try:
+                os.makedirs(cache_dir(), exist_ok=True)
+                SU.save_m(sfile, mcache)
+            except OSError as e:
+                log(f"cannot cache M matrices: {e}")
         t1 = time.time()
         timers.append((".main.setup", t1 - t0, 1))
-        log(f"setup (M, h_inf) for {len(q4s)} structure(s): {t1 - t0:.2f} s")
+        log(f"setup (h_inf{', M cached' if have_m else ', M'}) for {len(q4s)} structure(s): {t1 - t0:.2f} s")
         ids = gpu_count()
         if not ids:
             raise RuntimeError("no GPU")
@@ -342,7 +361,7 @@ def run_group(tasks, timers):
             t2 = time.time()
             if t2 - t1 > 0.5:
                 timers.append((".main.gpu_wait", t2 - t1, 1))
-            results = _gpu(tasks, q4s, sfile, timers)
+            results = _gpu(tasks, q4s, sfile, mcache if have_m else None, timers)
         finally:
             try:
                 import torch
@@ -355,7 +374,7 @@ def run_group(tasks, timers):
     timers.append((".main.write_output", time.time() - t3, 1))
 
 
-def _gpu(tasks, q4s, sfile, timers):
+def _gpu(tasks, q4s, sfile, mfile, timers):
     """-> {(q4, sign): (spins, pp, {coord: numpy object array (Jo, 2, S2, outputs, Dout)}, Output by coord,
     Smax)}"""
     import torch
@@ -364,7 +383,7 @@ def _gpu(tasks, q4s, sfile, timers):
     T = tasks[0]
     L = limbs(T.precision)
     t0 = time.time()
-    M, stasks = SU.read(sfile, L)
+    M, stasks = SU.read(sfile, L, m_path=mfile)
     by_q4 = {(st.q4, st.sign): st for st in stasks}
     # subgroups: same pseudo-parity types and sign -> same Plan and lambda orders
     sub = {}
@@ -410,36 +429,66 @@ def _gpu(tasks, q4s, sfile, timers):
         timers.append((".main.gpu.chain", t3 - t2, len(ns) * len(chunks)))
         log(f"pp {pp} sign {sign}: {len(sts)} structure(s) x {len(ns)} lambda order(s), batch <= {bmax}: "
             f"constants {t2 - t1:.2f} s, chain {t3 - t2:.2f} s")
+        outs_host = {k: _OutputInfo(o) for k, o in outs.items()}
         for ch, nums in zip(chunks, nums_all):
             vals = {}
             for (c, d), o in outs.items():
                 r = OUT.apply_per_order(o, nums)                   # (Jo, 2, S2, nq, outputs, Dmax)
-                vals[(c, d)] = r.to_mp()
+                vals[(c, d)] = (r.m.cpu().numpy(), r.e.cpu().numpy())       # host limbs (formatted later)
             for q, st in enumerate(ch):
-                results[(st.q4, st.sign)] = (tjs, pp, {k: v[:, :, :, q] for k, v in vals.items()}, outs, Sm)
+                results[(st.q4, st.sign)] = (tjs, pp, {k: (m[:, :, :, :, q], e[:, :, :, q]) for k, (m, e) in vals.items()},
+                                             outs_host, Sm, 32 * L - 2)
         timers.append((".main.gpu.write_output", time.time() - t3, 1))
     return results
 
 
+class _OutputInfo:
+    """what the writer needs of an output.Output (host only, picklable)"""
+
+    def __init__(self, o):
+        self.outputs = list(o.outputs)
+
+
+_JOBS = {}
+
+
 def _write(tasks, results):
+    """all spin files of all tasks, formatted in parallel (fork: the workers only use host data)"""
+    import multiprocessing as mpr
+    jobs = [(i, tj) for i, t in enumerate(tasks) for tj in t.two_js_internal]
+    _JOBS.update(tasks=tasks, results=results)
+    nproc = max(1, min(len(jobs), max(t.num_threads for t in tasks), os.cpu_count() or 1))
+    try:
+        if nproc == 1:
+            for j in jobs:
+                _write_one(j)
+        else:
+            with mpr.get_context("fork").Pool(nproc) as pool:
+                for _ in pool.imap_unordered(_write_one, jobs):
+                    pass
+    finally:
+        _JOBS.clear()
+
+
+def _write_one(job):
     from . import b3djson as BJ, structure as S
-    for t in tasks:
-        tjs, pp, vals, outs, Sm = results[(tuple(t.q4), t.sign)]
-        coords = [c for c in BJ.COORD_ORDER if c in t.coordinates]
-        for tj in t.two_js_internal:
-            jo = tjs.index(tj)
-            structs = [(len(S.so3(pp[k][0], t.two_j12, tj)), len(S.so3(pp[k][1], t.two_j43, tj))) for k in range(2)]
-            coord_rows = []
-            for c in coords:
-                o, v = outs[(c, t.delta_1_plus_2)], vals[(c, t.delta_1_plus_2)]
-                per = []
-                for k in range(2):
-                    per.append([[_rows(o, v[jo, k, a * Sm + b]) for b in range(structs[k][1])]
-                                for a in range(structs[k][0])])
-                coord_rows.append(per)
-            path = t.path(tj / 2.0)
-            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-            BJ.write_spin(path, t, tj, pp, structs, coord_rows)
+    i, tj = job
+    t = _JOBS["tasks"][i]
+    tjs, pp, vals, outs, Sm, prec = _JOBS["results"][(tuple(t.q4), t.sign)]
+    jo = tjs.index(tj)
+    structs = [(len(S.so3(pp[k][0], t.two_j12, tj)), len(S.so3(pp[k][1], t.two_j43, tj))) for k in range(2)]
+    coord_rows = []
+    for c in [c for c in BJ.COORD_ORDER if c in t.coordinates]:
+        o = outs[(c, t.delta_1_plus_2)]
+        m, e = vals[(c, t.delta_1_plus_2)]                         # (L, Jo, 2, S2, outputs, Dmax)
+        mj, ej = m[:, jo], e[jo]
+        v = np.array(BJ.limbs_to_mpfr(mj.reshape(mj.shape[0], -1), ej.reshape(-1), prec),
+                     dtype=object).reshape(ej.shape)               # (2, S2, outputs, Dmax)
+        coord_rows.append([[[_rows(o, v[k, a * Sm + b]) for b in range(structs[k][1])]
+                            for a in range(structs[k][0])] for k in range(2)])
+    path = t.path(tj / 2.0)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    BJ.write_spin(path, t, tj, pp, structs, coord_rows, gmp=True)
 
 
 def _rows(o, v):
@@ -453,16 +502,16 @@ def _rows(o, v):
 # ---------------------------------------------------------------- entry points
 
 def run_tasks(tasks, argvs):
-    """GPU for the supported tasks (grouped), official blocks_3d for the others; returns exit status"""
-    groups, status = {}, 0
-    for t, a in zip(tasks, argvs):
+    """GPU for the supported tasks (grouped), official blocks_3d for the others; -> exit status per task"""
+    groups, status = {}, [0] * len(tasks)
+    for i, t in enumerate(tasks):
         why = t.unsupported()
         if why:
-            status |= _run_fallback(a, why)
+            status[i] = _run_fallback(argvs[i], why)
         else:
-            groups.setdefault(t.group_key(), []).append((t, a))
-    for key, members in groups.items():
-        ts = [t for t, _ in members]
+            groups.setdefault(t.group_key(), []).append(i)
+    for key, idx in groups.items():
+        ts = [tasks[i] for i in idx]
         timers = []
         t0 = time.time()
         try:
@@ -470,17 +519,17 @@ def run_tasks(tasks, argvs):
         except Exception as e:
             import traceback
             log(traceback.format_exc())
-            for t, a in members:
-                status |= _run_fallback(a, f"GPU run failed: {type(e).__name__}: {e}")
+            for i in idx:
+                status[i] = _run_fallback(argvs[i], f"GPU run failed: {type(e).__name__}: {e}")
             continue
         total = time.time() - t0
         for t in ts:
             if t.profile:
-                BJ_profile(t, total, timers)
+                write_profile(t, total, timers)
     return status
 
 
-def BJ_profile(t, total, timers):
+def write_profile(t, total, timers):
     from . import b3djson as BJ
     path = fmt_template(t.out_template, 0.0) + ".profile"
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -497,6 +546,96 @@ def _run_fallback(argv, reason):
         env["LD_PRELOAD"] = (os.environ["BLOCKSVIBE_JEMALLOC"] + " " + env.get("LD_PRELOAD", "")).strip()
     log(f"fallback to {exe}: {reason}")
     return subprocess.run([exe] + list(argv), env=env).returncode
+
+
+# ---------------------------------------------------------------- spool: concurrent invocations -> one batch
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _atomic_write(path, text):
+    tmp = f"{path}.tmp{os.getpid()}"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def spool_run(task, argv):
+    """Join concurrent invocations of the same group into one GPU batch, transparently (hyperion calls
+    blocks_3d once per four-point structure).  Every invocation drops its arguments in a spool directory
+    per group; whoever holds the group's leader lock waits until no new task arrived for
+    BLOCKSVIBE_SPOOL_QUIET s (default 3, at most BLOCKSVIBE_SPOOL_MAX = 30 s), claims all pending tasks,
+    runs them as one batch and writes each task's exit status; the others wait for theirs.  A task
+    claimed by a leader that died is put back."""
+    import json
+    import uuid
+    root = os.environ.get("BLOCKSVIBE_SPOOL", os.path.join(tempfile.gettempdir(), "blocksvibe-spool"))
+    d = os.path.join(root, hashlib.sha1(repr(task.group_key()).encode()).hexdigest()[:20])
+    os.makedirs(d, exist_ok=True)
+    quiet = float(os.environ.get("BLOCKSVIBE_SPOOL_QUIET", "3"))
+    tmax = float(os.environ.get("BLOCKSVIBE_SPOOL_MAX", "30"))
+    me = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    _atomic_write(os.path.join(d, me + ".task"), json.dumps({"argv0": task.argv[0], "argv": argv}))
+    done = os.path.join(d, me + ".done")
+    lockf = open(os.path.join(d, "leader.lock"), "w")
+    while True:
+        if os.path.exists(done):
+            st = int(open(done).read().strip() or 1)
+            os.remove(done)
+            return st
+        try:
+            fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            time.sleep(0.5)
+            if not os.path.exists(os.path.join(d, me + ".task")):
+                claimed = [f for f in os.listdir(d) if f.startswith(me + ".claimed.")]
+                for f in claimed:                                  # leader died: put the task back
+                    pid = int(f.rsplit(".", 1)[1])
+                    if not _alive(pid) and not os.path.exists(done):
+                        try:
+                            os.rename(os.path.join(d, f), os.path.join(d, me + ".task"))
+                        except OSError:
+                            pass
+            continue
+        try:                                                       # leader
+            t0, last, n = time.time(), time.time(), -1
+            while True:
+                pending = sorted(f for f in os.listdir(d) if f.endswith(".task"))
+                if len(pending) != n:
+                    n, last = len(pending), time.time()
+                if time.time() - last >= quiet or time.time() - t0 >= tmax:
+                    break
+                time.sleep(0.25)
+            mine = []
+            for f in pending:
+                tid = f[:-5]
+                try:
+                    os.rename(os.path.join(d, f), os.path.join(d, f"{tid}.claimed.{os.getpid()}"))
+                    mine.append(tid)
+                except OSError:
+                    pass
+            if mine:
+                specs = [json.load(open(os.path.join(d, f"{tid}.claimed.{os.getpid()}"))) for tid in mine]
+                argvs = [sp["argv"] for sp in specs]
+                log(f"spool leader: batch of {len(mine)} task(s) after {time.time() - t0:.1f} s")
+                try:
+                    tasks = [Task(sp["argv"], sp["argv0"]) for sp in specs]
+                    status = run_tasks(tasks, argvs)
+                except Exception as e:
+                    log(f"spool batch failed: {e}")
+                    status = [_run_fallback(a, f"batch failed: {e}") for a in argvs]
+                for tid, st in zip(mine, status):
+                    _atomic_write(os.path.join(d, tid + ".done"), str(st))
+                    os.remove(os.path.join(d, f"{tid}.claimed.{os.getpid()}"))
+        finally:
+            fcntl.flock(lockf, fcntl.LOCK_UN)
 
 
 def main(argv=None):
@@ -517,20 +656,25 @@ def main(argv=None):
         except UsageError as e:
             print(f"Error: {e}", file=sys.stderr)
             return 1
-        return run_tasks(tasks, argvs)
+        return max(run_tasks(tasks, argvs), default=0)
     try:
         task = Task(argv, sys.argv[0] if sys.argv and sys.argv[0] else prog)
     except UsageError as e:
-        fallback(argv, f"options not understood ({e})") if os.environ.get("BLOCKSVIBE_FALLBACK") else None
+        if os.environ.get("BLOCKSVIBE_FALLBACK"):
+            fallback(argv, f"options not understood ({e})")
         print(f"Error: {e}", file=sys.stderr)
         return 1
     if task.help:
-        fallback(argv, "--help") if os.environ.get("BLOCKSVIBE_FALLBACK") else print(__doc__)
+        if os.environ.get("BLOCKSVIBE_FALLBACK"):
+            fallback(argv, "--help")
+        print(__doc__)
         return 0
     why = task.unsupported()
     if why:
         fallback(argv, why)
-    return run_tasks([task], [argv])
+    if os.environ.get("BLOCKSVIBE_SPOOL_OFF") != "1":
+        return spool_run(task, argv)
+    return run_tasks([task], [argv])[0]
 
 
 if __name__ == "__main__":
