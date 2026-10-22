@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Drop-in blocks_3d: same options, same output files, computed on the GPU by blocksvibe (blocksvibe/cli.py).
+# Python: $BLOCKSVIBE_PYTHON (default python3); blocksvibe and sdpvibe must be importable (pip install -e, or
+# PYTHONPATH).  Unsupported options fall back to $BLOCKSVIBE_FALLBACK (official binary, + $BLOCKSVIBE_JEMALLOC).
+HERE=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+export PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}"
+exec "${BLOCKSVIBE_PYTHON:-python3}" -m blocksvibe "$@"

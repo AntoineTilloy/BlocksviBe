@@ -378,8 +378,8 @@ def cauchy_tables(lev):
 
 class Recursion:
     """Numbers (M matrices, Q values, Cauchy coefficients) on the GPU for one Plan.
-    M: dict as in dump.read_M (strings) -- matrices for every key of plan.Mkeys; or None for
-    random O(1) matrices (timing runs: the cost does not depend on the values)."""
+    M: dict as in dump.read_M (strings) -- matrices for every key of plan.Mkeys; a setup.MTable (b3d_setup,
+    already on the GPU); or None for random O(1) matrices (timing runs: the cost does not depend on the values)."""
 
     def __init__(self, plan, M, L, pole="cuda", cauchy="auto", task_chunk=8192, kcut=128, ncut=128):
         """pole: "cuda" (two batched S x S GEMMs on CUDA cores, blocks/smallgemm.py) | "gemm" (batched
@@ -400,6 +400,14 @@ class Recursion:
 
     def _load_M(self, M, nM, Sm):
         L, plan = self.L, self.plan
+        if hasattr(M, "padded"):                        # setup.MTable: gather on the GPU, absent keys -> zero
+            mats = M.padded(Sm)
+            zero = mats.shape[0] - 1
+            rows = [0] * nM
+            for key, i in plan.Mkeys.items():
+                rows[i] = M.index.get(key, zero)
+            self.Mtab = _take(mats, torch.tensor(rows, dtype=torch.long, device=dev))
+            return
         strs = ["0"] * (nM * Sm * Sm)
         for key, i in plan.Mkeys.items():
             mat = M.get(key) or []
